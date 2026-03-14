@@ -1,0 +1,300 @@
+# QuorumCredit — Proof of Trust (PoT) Microlending
+
+> Trustless microlending powered by your social trust graph — built on Stellar Soroban.
+
+Platform: Stellar Soroban | Language: Rust | License: MIT
+
+---
+
+## About
+
+QuorumCredit is a decentralized microlending platform that replaces asset collateral with **social collateral**. Inspired by Stellar's **Federated Byzantine Agreement (FBA)**, it lets communities vouch for borrowers using staked XLM — no over-collateralization required.
+
+Traditional DeFi lending demands $100 locked up to borrow $50. QuorumCredit flips this: your trust network is your collateral. Vouchers stake XLM to back a borrower. If the loan is repaid, vouchers earn yield. If the borrower defaults, vouchers are slashed.
+
+This platform is designed for developers building on Stellar, fintech teams targeting underserved communities, and anyone exploring social-trust-based credit systems.
+
+---
+
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [How It Works](#how-it-works)
+- [Project Structure](#project-structure)
+- [Setup Instructions](#setup-instructions)
+- [Testing](#testing)
+- [Deployment](#deployment)
+- [Architecture](#architecture)
+- [Contributing](#contributing)
+
+---
+
+## Quick Start
+
+```bash
+# Clone the repository
+git clone https://github.com/your-org/QuorumCredit.git
+cd QuorumCredit
+
+# Build the contract
+cd QuorumCredit
+cargo build --target wasm32-unknown-unknown --release
+
+# Run tests
+cargo test
+```
+
+---
+
+## How It Works
+
+### 1. Vouching
+Users stake XLM to vouch for a borrower in their network. This stake is transferred into the contract and held as social collateral.
+
+### 2. Loan Eligibility
+A borrower becomes eligible once their total vouched stake meets the minimum threshold — no personal collateral needed.
+
+### 3. Repayment & Default
+
+| Outcome | Borrower | Vouchers |
+|---|---|---|
+| Loan repaid ✅ | Debt cleared, credit history improves | Earn 2% yield on staked XLM |
+| Default ❌ | Flagged, future borrowing restricted | 50% of stake slashed |
+
+### The FBA Inspiration
+
+Stellar nodes select their own **Quorum Slice** — a trusted subset of peers. QuorumCredit mirrors this: each borrower's eligibility is determined by their personal trust graph, not a central credit bureau. You aren't trusting a bank; you're trusting a specific slice of your social network.
+
+---
+
+## Project Structure
+
+```
+QuorumCredit/
+├── QuorumCredit/
+│   ├── Cargo.toml          # Contract crate (Soroban SDK)
+│   └── src/
+│       └── lib.rs          # Contract: initialize, vouch, request_loan, repay, slash
+├── Cargo.toml              # Workspace root
+└── README.md               # This file
+```
+
+**Key contract entry points:**
+
+| Function | Description |
+|---|---|
+| `initialize(admin, token)` | One-time setup — set admin and XLM token address |
+| `vouch(voucher, borrower, stake)` | Stake XLM to back a borrower |
+| `request_loan(borrower, amount, threshold)` | Disburse loan if stake threshold is met |
+| `repay(borrower)` | Repay loan; vouchers receive 2% yield |
+| `slash(borrower)` | Admin marks default; 50% of voucher stakes burned |
+| `get_loan(borrower)` | Read a borrower's active loan record |
+| `get_vouches(borrower)` | Read all vouches for a borrower |
+
+---
+
+## Setup Instructions
+
+### Requirements
+
+- Rust (latest stable)
+- Stellar CLI (`stellar-cli`)
+- A Stellar account (for deployment)
+
+### 1. Install Rust
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup target add wasm32-unknown-unknown
+```
+
+### 2. Install Stellar CLI
+
+```bash
+cargo install --locked stellar-cli
+stellar --version
+```
+
+### 3. Configure Networks
+
+```bash
+# Testnet (recommended for development)
+stellar network add testnet \
+  --rpc-url https://soroban-testnet.stellar.org:443 \
+  --network-passphrase "Test SDF Network ; September 2015"
+
+# Mainnet
+stellar network add mainnet \
+  --rpc-url https://rpc.mainnet.stellar.org:443 \
+  --network-passphrase "Public Global Stellar Network ; September 2015"
+```
+
+### 4. Environment Variables
+
+Create a `.env` file (never commit this):
+
+```bash
+NETWORK=testnet
+DEPLOYER_SECRET_KEY="SB..."   # Your deployer secret key
+ADMIN_ADDRESS="GB..."         # Admin account address
+TOKEN_CONTRACT="..."          # XLM token contract address
+```
+
+> ⚠️ Add `.env` to your `.gitignore`. Never commit secret keys.
+
+---
+
+## Testing
+
+```bash
+# Run all tests
+cd QuorumCredit
+cargo test
+
+# Run with output
+cargo test -- --nocapture
+
+# Run a specific test
+cargo test test_repay_gives_voucher_yield
+```
+
+**Test coverage:**
+
+| Test | Verifies |
+|---|---|
+| `test_vouch_and_loan_disbursed` | Loan record created, funds transferred to borrower |
+| `test_repay_gives_voucher_yield` | Voucher receives original stake + 2% yield |
+| `test_slash_burns_half_stake` | Voucher loses 50% of stake on default |
+
+---
+
+## Deployment
+
+### Deploy to Testnet
+
+```bash
+# Build
+cargo build --target wasm32-unknown-unknown --release
+
+# Deploy
+stellar contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/quorum_credit.wasm \
+  --network testnet \
+  --source $DEPLOYER_SECRET_KEY
+
+# Initialize
+stellar contract invoke \
+  --id $CONTRACT_ID \
+  --fn initialize \
+  --network testnet \
+  --source $DEPLOYER_SECRET_KEY \
+  --arg admin=$ADMIN_ADDRESS \
+  --arg token=$TOKEN_CONTRACT
+```
+
+### Deploy to Mainnet
+
+> ⚠️ Production checklist before deploying:
+> - [ ] All tests passing
+> - [ ] Security audit completed
+> - [ ] Testnet deployment verified
+> - [ ] Admin keys secured (multisig recommended)
+> - [ ] Token contract address confirmed
+
+```bash
+stellar contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/quorum_credit.wasm \
+  --network mainnet \
+  --source $DEPLOYER_SECRET_KEY
+```
+
+---
+
+## Architecture
+
+```
+Borrower
+   └── requests loan
+         └── Trust Circle (Quorum Slice)
+               ├── Voucher A — stakes XLM
+               ├── Voucher B — stakes XLM
+               └── Voucher C — stakes XLM
+                     └── Threshold met → Loan disbursed
+                           ├── Repaid → Vouchers earn 2% yield
+                           └── Default → 50% of stakes slashed
+```
+
+**Key concepts:**
+
+- **Proof of Trust (PoT):** Social collateral replaces asset collateral
+- **Quorum Slice:** Your personal set of trusted vouchers, mirroring FBA logic
+- **Slash Mechanism:** Vouchers lose 50% of stake on borrower default — aligning incentives
+- **Yield on Trust:** Vouchers earn 2% yield for backing reliable borrowers
+
+**Why Stellar?**
+
+- Near-zero transaction fees — critical for microlending viability
+- Fast finality (~5s) — practical for real-world loan cycles
+- Soroban smart contracts — expressive enough for trust graph logic
+- Native XLM — no bridging complexity for staking and disbursement
+
+---
+
+## Contributing
+
+Pull requests are welcome. For major changes, open an issue first.
+
+```bash
+# Fork and create a branch
+git checkout -b feature/your-feature
+
+# Format code
+cargo fmt --all
+
+# Ensure tests pass
+cargo test
+
+# Commit and push
+git commit -m "Add: description of changes"
+```
+
+**Standards:**
+- All new features must include tests
+- Run `cargo fmt --all` before committing
+- Update this README for any interface changes
+- Security implications must be reviewed before merging
+
+---
+
+## Roadmap
+
+- [x] Core vouching & slashing contract (Soroban)
+- [x] Real XLM token transfers via Soroban token interface
+- [x] Yield distribution on repayment
+- [x] Admin-gated slash with auth enforcement
+- [ ] Borrower credit scoring based on repayment history
+- [ ] Trust graph visualization (frontend)
+- [ ] Multi-asset loan support (USDC on Stellar)
+- [ ] Mobile-first UI for underserved communities
+
+---
+
+## Security
+
+- Never commit `.env` files or secret keys
+- Use hardware wallets or multisig for admin keys
+- Report vulnerabilities privately — do not open public issues
+
+---
+
+## License
+
+MIT
+
+---
+
+## Resources
+
+- [Stellar Documentation](https://developers.stellar.org)
+- [Soroban Docs](https://soroban.stellar.org)
+- [Stellar Developer Discord](https://discord.gg/stellardev)
