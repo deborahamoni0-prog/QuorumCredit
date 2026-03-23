@@ -110,6 +110,7 @@ impl QuorumCreditContract {
         threshold: i128,
     ) -> Result<(), ContractError> {
         borrower.require_auth();
+        assert!(threshold > 0, "threshold must be greater than zero");
 
         let vouches: Vec<VouchRecord> = env
             .storage()
@@ -236,7 +237,7 @@ impl QuorumCreditContract {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    fn token(env: &Env) -> token::Client {
+    fn token(env: &Env) -> token::Client<'_> {
         let addr: Address = env
             .storage()
             .instance()
@@ -331,6 +332,17 @@ mod tests {
 
         assert_eq!(token.balance(&voucher), 9_500_000);
         assert!(client.get_loan(&borrower).unwrap().defaulted);
+    }
+
+    #[test]
+    #[should_panic(expected = "threshold must be greater than zero")]
+    fn test_zero_threshold_rejected() {
+        let env = Env::default();
+        let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        client.request_loan(&borrower, &500_000, &0);
     }
 
     #[test]
