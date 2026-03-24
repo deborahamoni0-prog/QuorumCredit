@@ -12,6 +12,7 @@ use reputation::ReputationNftContractClient;
 
 const DEFAULT_YIELD_BPS: i128 = 200;
 const DEFAULT_SLASH_BPS: i128 = 5000;
+const _: () = assert!(DEFAULT_SLASH_BPS <= 10_000, "DEFAULT_SLASH_BPS must not exceed 10_000");
 const DEFAULT_MAX_VOUCHERS: u32 = 100;
 const DEFAULT_MIN_LOAN_AMOUNT: i128 = 100_000;
 const DEFAULT_LOAN_DURATION: u64 = 30 * 24 * 60 * 60;
@@ -53,7 +54,6 @@ pub enum DataKey {
     Paused,           // bool: true when contract is paused
     ReputationNft,    // Address of the ReputationNftContract
     Config,           // Config struct: all configurable protocol parameters
-    ReputationNft,    // Address of the ReputationNftContract
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -1700,5 +1700,30 @@ mod tests {
 
         // No NFT contract configured — should return 0 gracefully.
         assert_eq!(client.get_reputation(&borrower), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "slash_bps must be 1-10000")]
+    fn test_set_config_slash_bps_above_10000_rejected() {
+        let env = Env::default();
+        let (contract_id, _token_addr, _admin, _borrower, _voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        let mut cfg = client.get_config();
+        cfg.slash_bps = 10_001;
+        client.set_config(&cfg);
+    }
+
+    #[test]
+    fn test_set_config_slash_bps_at_boundary_10000_accepted() {
+        let env = Env::default();
+        let (contract_id, _token_addr, _admin, _borrower, _voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        let mut cfg = client.get_config();
+        cfg.slash_bps = 10_000;
+        client.set_config(&cfg);
+
+        assert_eq!(client.get_config().slash_bps, 10_000);
     }
 }
