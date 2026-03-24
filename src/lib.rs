@@ -51,6 +51,7 @@ pub enum DataKey {
     SlashTreasury,       // i128 accumulated slashed funds
     Paused,              // bool: true when contract is paused
     LoanDuration,        // u64 configurable loan duration in seconds
+    BorrowerList,        // Vec<Address> of all borrowers who have ever requested a loan
 }
 
 // ── Data Types ────────────────────────────────────────────────────────────────
@@ -262,6 +263,17 @@ impl QuorumCreditContract {
                 deadline,
             },
         );
+
+        // Track borrower in the global list for admin pagination.
+        let mut borrowers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BorrowerList)
+            .unwrap_or(Vec::new(&env));
+        borrowers.push_back(borrower.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::BorrowerList, &borrowers);
 
         // Disburse the loan to the borrower.
         token.transfer(&env.current_contract_address(), &borrower, &amount);
@@ -647,6 +659,37 @@ impl QuorumCreditContract {
         env.storage().persistent().get(&DataKey::Vouches(borrower))
     }
 
+    /// Admin-only paginated view of all loan records.
+    /// Returns the slice of LoanRecords for the given page (0-indexed).
+    pub fn get_all_loans(env: Env, page: u32, page_size: u32) -> Vec<LoanRecord> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+
+        assert!(page_size > 0, "page_size must be greater than zero");
+
+        let borrowers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BorrowerList)
+            .unwrap_or(Vec::new(&env));
+
+        let start = (page * page_size) as usize;
+        let mut result = Vec::new(&env);
+
+        for i in start..(start + page_size as usize).min(borrowers.len() as usize) {
+            let borrower = borrowers.get(i as u32).unwrap();
+            if let Some(loan) = env.storage().persistent().get(&DataKey::Loan(borrower)) {
+                result.push_back(loan);
+            }
+        }
+
+        result
+    }
+
     /// Returns the total staked amount across all vouchers for a given borrower.
     /// Returns 0 if the borrower has no vouches.
     pub fn total_vouched(env: Env, borrower: Address) -> i128 {
@@ -718,8 +761,6 @@ mod tests {
             &token_id.address(),
             &150,
         );
-        QuorumCreditContractClient::new(env, &contract_id)
-            .initialize(&admin, &admin, &token_id.address(), &150);
 
         (contract_id, token_id.address(), admin, borrower, voucher)
     }
@@ -816,8 +857,6 @@ mod tests {
             &token_id.address(),
             &150,
         );
-        QuorumCreditContractClient::new(&env, &contract_id)
-            .initialize(&admin, &admin, &token_id.address(), &150);
 
         let client = QuorumCreditContractClient::new(&env, &contract_id);
         // Stake 1_000_000 — contract now holds exactly 1_000_000.
@@ -1286,6 +1325,47 @@ mod tests {
         client.request_loan(&borrower, &500_000, &1_000_000);
         client.slash(&borrower);
         assert_eq!(client.loan_status(&borrower), LoanStatus::Defaulted);
+    }
+
+    // ── get_all_loans Tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_all_loans_pagination() {
+        let env = Env::default();
+        let (contract_id, token_addr, _admin, _, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let token_admin = StellarAssetClient::new(&env, &token_addr);
+
+        // Create 3 borrowers with active loans.
+        let mut borrowers = Vec::new(&env);
+        for _ in 0..3u32 {
+            let b = Address::generate(&env);
+            token_admin.mint(&voucher, &2_000_000);
+            client.vouch(&voucher, &b, &1_000_000);
+            client.request_loan(&b, &500_000, &1_000_000);
+            borrowers.push_back(b);
+        }
+
+        // Page 0, size 2 → first 2 loans.
+        let page0 = client.get_all_loans(&0, &2);
+        assert_eq!(page0.len(), 2);
+        assert_eq!(page0.get(0).unwrap().borrower, borrowers.get(0).unwrap());
+        assert_eq!(page0.get(1).unwrap().borrower, borrowers.get(1).unwrap());
+
+        // Page 1, size 2 → last loan.
+        let page1 = client.get_all_loans(&1, &2);
+        assert_eq!(page1.len(), 1);
+        assert_eq!(page1.get(0).unwrap().borrower, borrowers.get(2).unwrap());
+    }
+
+    #[test]
+    fn test_get_all_loans_empty_when_no_loans() {
+        let env = Env::default();
+        let (contract_id, _, _, _, _) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        let result = client.get_all_loans(&0, &10);
+        assert_eq!(result.len(), 0);
     }
 
     #[test]
