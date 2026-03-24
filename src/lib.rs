@@ -102,11 +102,12 @@ impl Config {
 #[derive(Clone)]
 pub struct LoanRecord {
     pub borrower: Address,
-    pub amount: i128, // in stroops
+    pub amount: i128,              // in stroops
     pub repaid: bool,
     pub defaulted: bool,
-    pub created_at: u64, // ledger timestamp
-    pub deadline: u64,   // repayment deadline (ledger timestamp)
+    pub created_at: u64,           // ledger timestamp
+    pub deadline: u64,             // repayment deadline (ledger timestamp)
+    pub slash_timestamp: Option<u64>, // set once when loan is slashed; None otherwise
 }
 
 #[contracttype]
@@ -312,6 +313,7 @@ impl QuorumCreditContract {
                 defaulted: false,
                 created_at: now,
                 deadline,
+                slash_timestamp: None,
             },
         );
 
@@ -446,6 +448,7 @@ impl QuorumCreditContract {
         }
 
         loan.defaulted = true;
+        loan.slash_timestamp = Some(env.ledger().timestamp());
         env.storage()
             .persistent()
             .set(&DataKey::Loan(borrower.clone()), &loan);
@@ -613,6 +616,7 @@ impl QuorumCreditContract {
         }
 
         loan.defaulted = true;
+        loan.slash_timestamp = Some(env.ledger().timestamp());
         env.storage()
             .persistent()
             .set(&DataKey::Loan(borrower.clone()), &loan);
@@ -1825,5 +1829,114 @@ mod tests {
         client.set_config(&cfg);
 
         assert_eq!(client.get_config().slash_bps, 10_000);
+    }
+
+    // ── slash_timestamp audit tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_slash_timestamp_set_on_slash() {
+        let env = Env::default();
+        env.ledger().set_timestamp(2_000_000);
+        let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        client.request_loan(&borrower, &500_000, &1_000_000);
+        client.slash(&borrower);
+
+        let loan = client.get_loan(&borrower).unwrap();
+        assert_eq!(loan.slash_timestamp, Some(2_000_000));
+    }
+
+    #[test]
+    fn test_slash_timestamp_none_for_repaid_loan() {
+        let env = Env::default();
+        let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        client.request_loan(&borrower, &500_000, &1_000_000);
+        client.repay(&borrower);
+
+        let loan = client.get_loan(&borrower).unwrap();
+        assert_eq!(loan.slash_timestamp, None);
+    }
+
+    #[test]
+    fn test_slash_timestamp_none_for_active_loan() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        client.request_loan(&borrower, &500_000, &1_000_000);
+
+        let loan = client.get_loan(&borrower).unwrap();
+        assert_eq!(loan.slash_timestamp, None);
+    }
+
+    #[test]
+    fn test_slash_timestamp_not_overwritten_on_repeated_slash_attempt() {
+        let env = Env::default();
+        env.ledger().set_timestamp(3_000_000);
+        let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        client.request_loan(&borrower, &500_000, &1_000_000);
+        client.slash(&borrower);
+
+        let loan_after_first_slash = client.get_loan(&borrower).unwrap();
+        assert_eq!(loan_after_first_slash.slash_timestamp, Some(3_000_000));
+
+        // Advance time and attempt a second slash — must be rejected.
+        env.ledger().set_timestamp(4_000_000);
+        let result = client.try_slash(&borrower);
+        assert!(result.is_err(), "second slash must fail");
+
+        // Timestamp must remain unchanged.
+        let loan_after_second_attempt = client.get_loan(&borrower).unwrap();
+        assert_eq!(loan_after_second_attempt.slash_timestamp, Some(3_000_000));
+    }
+
+    #[test]
+    fn test_auto_slash_timestamp_set_after_deadline() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        client.set_config(&{
+            let mut c = client.get_config();
+            c.loan_duration = 1_000;
+            c
+        });
+        client.vouch(&voucher, &borrower, &1_000_000);
+        client.request_loan(&borrower, &500_000, &1_000_000);
+
+        env.ledger().set_timestamp(1_002_000);
+        client.auto_slash(&borrower);
+
+        let loan = client.get_loan(&borrower).unwrap();
+        assert_eq!(loan.slash_timestamp, Some(1_002_000));
+    }
+
+    #[test]
+    fn test_slash_timestamp_persists_through_storage_read_write() {
+        let env = Env::default();
+        env.ledger().set_timestamp(5_000_000);
+        let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        client.request_loan(&borrower, &500_000, &1_000_000);
+        client.slash(&borrower);
+
+        // Read back from storage and verify the timestamp survived serialisation round-trip.
+        let loan = client.get_loan(&borrower).unwrap();
+        assert!(loan.defaulted);
+        assert_eq!(loan.slash_timestamp, Some(5_000_000));
+        assert_eq!(loan.slash_timestamp.unwrap(), 5_000_000);
     }
 }
