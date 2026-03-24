@@ -31,15 +31,16 @@ pub enum ContractError {
 
 #[contracttype]
 pub enum DataKey {
-    Loan(Address),    // borrower → LoanRecord
-    Vouches(Address), // borrower → Vec<VouchRecord>
-    Admin,            // Address allowed to call slash
-    Token,            // XLM token contract address
-    Deployer,         // Address that deployed the contract; guards initialize
-    MaxLoanToStakeRatio, // Maximum loan-to-stake ratio (percentage * 100)
-    SlashTreasury,    // i128 accumulated slashed funds
-    Paused,           // bool: true when contract is paused
-    LoanDuration,     // u64 configurable loan duration in seconds
+    Loan(Address),           // borrower → LoanRecord
+    Vouches(Address),        // borrower → Vec<VouchRecord>
+    VoucherHistory(Address), // voucher → Vec<Address> (borrowers backed)
+    Admin,                   // Address allowed to call slash
+    Token,                   // XLM token contract address
+    Deployer,                // Address that deployed the contract; guards initialize
+    MaxLoanToStakeRatio,     // Maximum loan-to-stake ratio (percentage * 100)
+    SlashTreasury,           // i128 accumulated slashed funds
+    Paused,                  // bool: true when contract is paused
+    LoanDuration,            // u64 configurable loan duration in seconds
 }
 
 // ── Data Types ────────────────────────────────────────────────────────────────
@@ -126,6 +127,17 @@ impl QuorumCreditContract {
         // Transfer stake from voucher into the contract.
         let token = Self::token(&env);
         token.transfer(&voucher, &env.current_contract_address(), &stake);
+
+        // Track voucher → borrowers history.
+        let mut history: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VoucherHistory(voucher.clone()))
+            .unwrap_or(Vec::new(&env));
+        history.push_back(borrower.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::VoucherHistory(voucher.clone()), &history);
 
         vouches.push_back(VouchRecord { voucher, stake });
         env.storage()
@@ -557,6 +569,15 @@ impl QuorumCreditContract {
 
     pub fn get_vouches(env: Env, borrower: Address) -> Option<Vec<VouchRecord>> {
         env.storage().persistent().get(&DataKey::Vouches(borrower))
+    }
+
+    /// Returns all borrower addresses that the given voucher has ever backed.
+    /// Returns an empty Vec if the voucher has no history.
+    pub fn voucher_history(env: Env, voucher: Address) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::VoucherHistory(voucher))
+            .unwrap_or(Vec::new(&env))
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -1065,5 +1086,43 @@ mod tests {
         let client = QuorumCreditContractClient::new(&env, &contract_id);
 
         assert_eq!(client.get_admin(), admin);
+    }
+
+    // ── Voucher History Tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_voucher_history_tracks_multiple_borrowers() {
+        let env = Env::default();
+        let (contract_id, token_addr, _admin, _borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let token_admin = StellarAssetClient::new(&env, &token_addr);
+
+        let borrower_a = Address::generate(&env);
+        let borrower_b = Address::generate(&env);
+        let borrower_c = Address::generate(&env);
+
+        // Give voucher enough balance for three vouches.
+        token_admin.mint(&voucher, &10_000_000);
+
+        client.vouch(&voucher, &borrower_a, &1_000_000);
+        client.vouch(&voucher, &borrower_b, &1_000_000);
+        client.vouch(&voucher, &borrower_c, &1_000_000);
+
+        let history = client.voucher_history(&voucher);
+        assert_eq!(history.len(), 3);
+        assert_eq!(history.get(0).unwrap(), borrower_a);
+        assert_eq!(history.get(1).unwrap(), borrower_b);
+        assert_eq!(history.get(2).unwrap(), borrower_c);
+    }
+
+    #[test]
+    fn test_voucher_history_unknown_voucher_returns_empty() {
+        let env = Env::default();
+        let (contract_id, _token_addr, _admin, _borrower, _voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        let unknown = Address::generate(&env);
+        let history = client.voucher_history(&unknown);
+        assert_eq!(history.len(), 0);
     }
 }
