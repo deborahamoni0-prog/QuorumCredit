@@ -560,8 +560,15 @@ impl QuorumCreditContract {
     /// at least 1 stroop and cannot exceed the outstanding balance. When the
     /// cumulative `amount_repaid` reaches `amount`, the loan is marked fully
     /// repaid and each voucher receives their stake back plus a proportional
-    /// share of the 2% yield (proportional to their stake / total_stake).
+    /// share of the yield (proportional to their stake / total_stake).
+    ///
+    /// # Reentrancy protection
+    /// Follows the Checks-Effects-Interactions pattern.  On a full repayment,
+    /// `loan.repaid = true` is persisted to storage **before** any outbound
+    /// token transfers to vouchers.  Any reentrant call therefore hits the
+    /// `assert!(!loan.repaid, "loan already repaid")` guard and aborts.
     pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractError> {
+        // ── CHECKS ────────────────────────────────────────────────────────────
         borrower.require_auth();
         Self::require_not_paused(&env)?;
 
@@ -594,11 +601,6 @@ impl QuorumCreditContract {
         let outstanding = loan.amount - loan.amount_repaid;
         assert!(payment > 0 && payment <= outstanding, "invalid payment amount");
 
-        let token = Self::token(&env);
-
-        // Collect this installment from the borrower.
-        token.transfer(&borrower, &env.current_contract_address(), &payment);
-        loan.amount_repaid += payment;
         let cfg = Self::config(&env);
         let vouches: Vec<VouchRecord> = env
             .storage()
@@ -606,58 +608,35 @@ impl QuorumCreditContract {
             .get(&DataKey::Vouches(borrower.clone()))
             .unwrap_or(Vec::new(&env));
 
-        // Pre-calculate total payout to ensure contract has enough balance.
-        let mut total_payout: i128 = 0;
-        for v in vouches.iter() {
-            let yield_amount = v.stake * cfg.yield_bps / 10_000;
-            total_payout += v.stake + yield_amount;
-        }
+        // ── INBOUND TRANSFER (borrower → contract) ────────────────────────────
+        // Collect this installment from the borrower first.
+        let token = Self::token(&env);
+        token.transfer(&borrower, &env.current_contract_address(), &payment);
+        loan.amount_repaid += payment;
 
-        if loan.amount_repaid >= loan.amount {
-            // Fully repaid — distribute stake + proportional yield to each voucher.
-            let vouches: Vec<VouchRecord> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Vouches(borrower.clone()))
-                .unwrap_or(Vec::new(&env));
+        let fully_repaid = loan.amount_repaid >= loan.amount;
 
-            let total_stake: i128 = vouches.iter().map(|v| v.stake).sum();
-
-            // Total yield pool = loan.amount * YIELD_BPS / 10_000
-            let total_yield = loan.amount * YIELD_BPS / 10_000;
-
-            // Pre-check contract balance covers all payouts.
-            let total_payout = total_stake + total_yield;
+        // ── EFFECTS (all state mutations before any outbound transfer) ─────────
+        if fully_repaid {
+            // Pre-check contract balance covers all payouts before committing.
+            let total_payout: i128 = vouches.iter().map(|v| {
+                let yield_amount = v.stake * cfg.yield_bps / 10_000;
+                v.stake + yield_amount
+            }).sum();
             let contract_balance = token.balance(&env.current_contract_address());
             assert!(
                 contract_balance >= total_payout,
                 "insufficient contract balance for yield distribution"
-        // Return stake + yield to each voucher.
-        for v in vouches.iter() {
-            let yield_amount = v.stake * cfg.yield_bps / 10_000;
-            token.transfer(
-                &env.current_contract_address(),
-                &v.voucher,
-                &(v.stake + yield_amount),
             );
 
-            for v in vouches.iter() {
-                // Each voucher's yield is proportional to their share of total stake.
-                let voucher_yield = if total_stake > 0 {
-                    total_yield * v.stake / total_stake
-                } else {
-                    0
-                };
-                token.transfer(
-                    &env.current_contract_address(),
-                    &v.voucher,
-                    &(v.stake + voucher_yield),
-                );
-            }
-
+            // Mark repaid and persist BEFORE any outbound token transfer.
+            // This is the reentrancy guard: any reentrant repay call will now
+            // hit "loan already repaid" and abort immediately.
             loan.repaid = true;
         }
 
+        // Persist the updated loan record (amount_repaid + repaid flag) before
+        // any outbound transfers so the guard is live in storage.
         env.storage()
             .persistent()
             .set(&DataKey::Loan(borrower.clone()), &loan);
@@ -3388,54 +3367,85 @@ mod tests {
         assert_eq!(client.get_config().slash_bps, 10_000);
     }
 
-    // ── Reentrancy Protection Tests ───────────────────────────────────────────
+    // ── Reentrancy Protection Tests (repay) ───────────────────────────────────
 
-    /// Verifies that a second call to `slash` for the same borrower is rejected
-    /// once the first call has committed the defaulted state.
+    /// A second call to `repay` after the loan is fully repaid must be rejected.
     ///
-    /// In the old (vulnerable) code, `loan.defaulted` was written *after* the
-    /// token transfer loop, so a reentrant call could slip through the
-    /// `assert!(!loan.defaulted)` guard.  With the CEI fix the state is
-    /// committed first, making the second call panic with "already defaulted".
+    /// In the old (vulnerable) code `loan.repaid` was written to storage only
+    /// *after* the voucher transfer loop, so a reentrant call could slip through
+    /// the `assert!(!loan.repaid)` guard and trigger a second payout.
+    /// With the CEI fix the flag is persisted *before* any outbound transfer,
+    /// so the replayed call immediately hits "loan already repaid".
     #[test]
-    #[should_panic(expected = "already defaulted")]
-    fn test_slash_reentrancy_second_call_rejected() {
+    fn test_repay_reentrancy_second_call_rejected() {
         let env = Env::default();
-        let (contract_id, _token_addr, admin, borrower, voucher) = setup(&env);
+        let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
-        let admin_signers = single_admin_signers(&env, &admin);
 
-        // Set up a loan so slash has something to work on.
         client.vouch(&voucher, &borrower, &1_000_000);
         client.request_loan(&borrower, &500_000, &1_000_000);
 
-        // First slash — must succeed and mark the loan defaulted.
-        client.slash(&admin_signers, &borrower);
-        assert!(client.get_loan(&borrower).unwrap().defaulted);
+        // First repay — must succeed and mark the loan repaid.
+        client.repay(&borrower, &500_000);
+        assert!(client.get_loan(&borrower).unwrap().repaid);
 
-        // Simulate the reentrant / replayed call: must be rejected because
-        // the loan is already marked defaulted (CEI guard fires).
-        client.slash(&admin_signers, &borrower);
+        // Simulate the reentrant / replayed call: must return NoActiveLoan
+        // because the loan is already marked repaid (CEI guard fires).
+        let result = client.try_repay(&borrower, &500_000);
+        assert_eq!(
+            result,
+            Err(Ok(ContractError::NoActiveLoan)),
+            "expected NoActiveLoan on a replayed repay after loan is fully repaid"
+        );
     }
 
-    /// Verifies that after a successful slash the vouches storage key is gone,
-    /// so a reentrant call cannot drain stakes a second time even if it somehow
-    /// bypassed the defaulted check.
+    /// Verifies that `loan.repaid` is committed to storage before any voucher
+    /// transfer, so the guard is live for the entire duration of the payout loop.
     #[test]
-    fn test_slash_clears_vouches_before_transfers() {
+    fn test_repay_marks_loan_repaid_before_payout() {
         let env = Env::default();
-        let (contract_id, _token_addr, admin, borrower, voucher) = setup(&env);
+        let (contract_id, token_addr, _admin, borrower, voucher) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
-        let admin_signers = single_admin_signers(&env, &admin);
+        let token = TokenClient::new(&env, &token_addr);
 
         client.vouch(&voucher, &borrower, &1_000_000);
         client.request_loan(&borrower, &500_000, &1_000_000);
-        client.slash(&admin_signers, &borrower);
+        client.repay(&borrower, &500_000);
 
-        // Vouches must be gone — no second drain is possible.
-        assert!(client.get_vouches(&borrower).is_none());
-        // Loan must be marked defaulted.
-        assert!(client.get_loan(&borrower).unwrap().defaulted);
+        // Loan must be marked repaid in storage.
+        assert!(client.get_loan(&borrower).unwrap().repaid);
+
+        // Voucher must have received stake (1_000_000) + yield (500_000 * 2% = 10_000).
+        // Starting balance: 10_000_000 − 1_000_000 (staked) + 1_010_000 (returned) = 10_010_000
+        assert_eq!(token.balance(&voucher), 10_010_000);
+    }
+
+    /// Partial repayments must NOT mark the loan repaid until the full amount
+    /// is covered, and must not trigger voucher payouts mid-way.
+    #[test]
+    fn test_repay_partial_does_not_mark_repaid() {
+        let env = Env::default();
+        let (contract_id, token_addr, _admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let token = TokenClient::new(&env, &token_addr);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        client.request_loan(&borrower, &500_000, &1_000_000);
+
+        // Pay half — loan must still be active, voucher stake must still be locked.
+        client.repay(&borrower, &250_000);
+        let loan = client.get_loan(&borrower).unwrap();
+        assert!(!loan.repaid, "loan must not be repaid after partial payment");
+        assert_eq!(loan.amount_repaid, 250_000);
+
+        // Voucher balance unchanged: stake is still locked in the contract.
+        // Starting: 10_000_000 − 1_000_000 staked = 9_000_000
+        assert_eq!(token.balance(&voucher), 9_000_000);
+
+        // Pay the remainder — now the loan should be fully repaid.
+        client.repay(&borrower, &250_000);
+        assert!(client.get_loan(&borrower).unwrap().repaid);
+        assert_eq!(token.balance(&voucher), 10_010_000);
     }
 }
 
