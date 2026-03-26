@@ -1,10 +1,7 @@
 #![no_std]
 
-use soroban_sdk::{
-    contract, contractimpl, panic_with_error, symbol_short, Address, BytesN, Env, Vec,
-};
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, BytesN, Env, Vec};
 
-// Module declarations
 pub mod admin;
 pub mod errors;
 pub mod helpers;
@@ -13,7 +10,6 @@ pub mod reputation;
 pub mod types;
 pub mod vouch;
 
-// Re-exports for external use
 pub use errors::ContractError;
 pub use types::*;
 
@@ -25,7 +21,6 @@ pub struct QuorumCreditContract;
 
 #[contractimpl]
 impl QuorumCreditContract {
-    /// One-time initialisation: set admins, XLM token address, and default config.
     pub fn initialize(
         env: Env,
         deployer: Address,
@@ -36,10 +31,9 @@ impl QuorumCreditContract {
         deployer.require_auth();
 
         if env.storage().instance().has(&DataKey::Config) {
-            panic_with_error!(&env, ContractError::AlreadyInitialized);
+            return Err(ContractError::AlreadyInitialized);
         }
 
-        // Validate admin addresses and configuration
         validate_admin_config(&env, &admins, admin_threshold)?;
 
         // Validate token address implements SEP-41 token interface before writing any state
@@ -64,13 +58,11 @@ impl QuorumCreditContract {
 
         env.events().publish(
             (symbol_short!("contract"), symbol_short!("init")),
-            (deployer.clone(), admins, admin_threshold, token),
+            (deployer, admins, admin_threshold, token),
         );
 
         Ok(())
     }
-
-    // ── Vouch Functions ───────────────────────────────────────────────────────
 
     pub fn vouch(
         env: Env,
@@ -125,8 +117,6 @@ impl QuorumCreditContract {
         vouch::transfer_vouch(env, from, to, borrower)
     }
 
-    // ── Loan Functions ────────────────────────────────────────────────────────
-
     pub fn request_loan(
         env: Env,
         borrower: Address,
@@ -139,8 +129,6 @@ impl QuorumCreditContract {
     pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractError> {
         loan::repay(env, borrower, payment)
     }
-
-    // ── Admin Functions ───────────────────────────────────────────────────────
 
     pub fn add_admin(env: Env, admin_signers: Vec<Address>, new_admin: Address) {
         admin::add_admin(env, admin_signers, new_admin)
@@ -223,8 +211,6 @@ impl QuorumCreditContract {
     pub fn set_max_loan_to_stake_ratio(env: Env, admin_signers: Vec<Address>, ratio: u32) {
         admin::set_max_loan_to_stake_ratio(env, admin_signers, ratio)
     }
-
-    // ── View Functions ────────────────────────────────────────────────────────
 
     pub fn is_initialized(env: Env) -> bool {
         env.storage().instance().has(&DataKey::Config)
