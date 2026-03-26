@@ -625,16 +625,21 @@ impl QuorumCreditContract {
             let total_yield = loan.amount * cfg.yield_bps / 10_000;
         }
 
-            // Pre-check contract balance covers all payouts before committing.
+            // ── Pre-calculate total payout and assert contract has sufficient balance ──
+            // This prevents a mid-loop panic if the contract balance is insufficient
+            // to cover stake + yield for all vouchers (fixes issue #10).
             let total_payout: i128 = vouches.iter().map(|v| {
-                let yield_amount = v.stake * cfg.yield_bps / 10_000;
-                v.stake + yield_amount
+                let voucher_yield = if total_stake > 0 {
+                    total_yield * v.stake / total_stake
+                } else {
+                    0
+                };
+                v.stake + voucher_yield
             }).sum();
             let contract_balance = token.balance(&env.current_contract_address());
-            assert!(
-                contract_balance >= total_payout,
-                "insufficient contract balance for yield distribution"
-            );
+            if contract_balance < total_payout {
+                return Err(ContractError::InsufficientFunds);
+            }
 
             // Return stake + yield to each voucher.
             for v in vouches.iter() {
