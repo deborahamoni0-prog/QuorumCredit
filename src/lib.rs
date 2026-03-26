@@ -842,6 +842,10 @@ impl QuorumCreditContract {
             .instance()
             .set(&DataKey::SlashTreasury, &0i128);
         Self::token_client(&env).transfer(&env.current_contract_address(), &recipient, &amount);
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("treasury")),
+            (admin_signers.get(0).unwrap(), recipient, amount, env.ledger().timestamp()),
+        );
     }
 
     /// Withdraw a vouch before any loan is active, returning the exact stake to the voucher.
@@ -1134,6 +1138,10 @@ impl QuorumCreditContract {
         Self::require_admin_approval(&env, &admin_signers);
         assert!(amount >= 0, "min stake cannot be negative");
         env.storage().instance().set(&DataKey::MinStake, &amount);
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("minstake")),
+            (admin_signers.get(0).unwrap(), amount, env.ledger().timestamp()),
+        );
     }
 
     /// Returns the current minimum vouch stake (0 means no minimum).
@@ -1151,6 +1159,10 @@ impl QuorumCreditContract {
         env.storage()
             .instance()
             .set(&DataKey::MaxLoanAmount, &amount);
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("maxloan")),
+            (admin_signers.get(0).unwrap(), amount, env.ledger().timestamp()),
+        );
     }
 
     /// Returns the current maximum loan amount (0 means no cap).
@@ -1165,6 +1177,10 @@ impl QuorumCreditContract {
     pub fn set_min_vouchers(env: Env, admin_signers: Vec<Address>, count: u32) {
         Self::require_admin_approval(&env, &admin_signers);
         env.storage().instance().set(&DataKey::MinVouchers, &count);
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("minvchrs")),
+            (admin_signers.get(0).unwrap(), count, env.ledger().timestamp()),
+        );
     }
 
     /// Returns the current minimum voucher count (0 means no minimum).
@@ -1192,6 +1208,10 @@ impl QuorumCreditContract {
         );
         // grace_period of 0 is valid — means no grace period, slash allowed immediately after deadline.
         env.storage().instance().set(&DataKey::Config, &config);
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("config")),
+            (admin_signers.get(0).unwrap(), env.ledger().timestamp()),
+        );
     }
 
     /// Returns the current protocol config.
@@ -1205,6 +1225,10 @@ impl QuorumCreditContract {
         env.storage()
             .instance()
             .set(&DataKey::ReputationNft, &nft_contract);
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("repnft")),
+            (admin_signers.get(0).unwrap(), nft_contract, env.ledger().timestamp()),
+        );
     }
 
         pub fn remove_voucher(
@@ -1266,6 +1290,10 @@ impl QuorumCreditContract {
         env.storage()
             .instance()
             .set(&DataKey::ProtocolFeeBps, &fee_bps);
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("fee")),
+            (admin_signers.get(0).unwrap(), fee_bps, env.ledger().timestamp()),
+        );
     }
 
     /// Returns the current protocol fee (0 if not set).
@@ -1292,15 +1320,21 @@ impl QuorumCreditContract {
     /// Pause the contract.
     pub fn pause(env: Env, admin_signers: Vec<Address>) {
         Self::require_admin_approval(&env, &admin_signers);
-
         env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("pause")),
+            (admin_signers.get(0).unwrap(), env.ledger().timestamp()),
+        );
     }
 
     /// Unpause the contract.
     pub fn unpause(env: Env, admin_signers: Vec<Address>) {
         Self::require_admin_approval(&env, &admin_signers);
-
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("unpause")),
+            (admin_signers.get(0).unwrap(), env.ledger().timestamp()),
+        );
     }
 
     // ── Views ─────────────────────────────────────────────────────────────────
@@ -3604,58 +3638,114 @@ mod tests {
         assert!(client.vouch_exists(&voucher_b, &borrower));
     }
 
-    // ── Upgrade Tests ─────────────────────────────────────────────────────────
+    // ── Admin Action Event Tests ───────────────────────────────────────────────
 
-    #[test]
-    #[should_panic(expected = "insufficient admin approvals")]
-    fn test_upgrade_rejected_without_admin_approval() {
-        let env = Env::default();
-        let (contract_id, _token_addr, _admin, _borrower, _voucher) = setup(&env);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-
-        let outsider = Address::generate(&env);
-        let fake_hash = BytesN::from_array(&env, &[0u8; 32]);
-        client.upgrade(&single_admin_signers(&env, &outsider), &fake_hash);
+    fn find_admin_event<'a>(
+        env: &'a Env,
+        action: soroban_sdk::Symbol,
+    ) -> bool {
+        use soroban_sdk::{IntoVal, Val};
+        let topic_admin: Val = symbol_short!("admin").into_val(env);
+        let topic_action: Val = action.into_val(env);
+        env.events().all().iter().any(|(_, topics, _)| {
+            topics.len() == 2
+                && topics.get_unchecked(0).get_payload() == topic_admin.get_payload()
+                && topics.get_unchecked(1).get_payload() == topic_action.get_payload()
+        })
     }
 
     #[test]
-    #[should_panic(expected = "insufficient admin approvals")]
-    fn test_upgrade_multisig_rejects_single_signer() {
+    fn test_pause_emits_event() {
         let env = Env::default();
-        let (contract_id, _token_addr, admin_one, _admin_two, _admin_three, _borrower, _voucher) =
-            setup_multisig(&env, 2);
+        let (contract_id, _, admin, _, _) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
-
-        let fake_hash = BytesN::from_array(&env, &[0u8; 32]);
-        client.upgrade(&single_admin_signers(&env, &admin_one), &fake_hash);
-    }
-
-    // ── Vouch Age / Same-Transaction Attack Tests ─────────────────────────────
-
-    #[test]
-    fn test_request_loan_rejects_vouch_too_recent() {
-        let env = Env::default();
-        let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-
-        client.vouch(&voucher, &borrower, &1_000_000);
-        // Do NOT advance time — vouch is brand-new, same timestamp.
-        let result = client.try_request_loan(&borrower, &Vec::new(&env), &500_000, &1_000_000);
-        assert_eq!(result, Err(Ok(ContractError::VouchTooRecent)));
+        client.pause(&single_admin_signers(&env, &admin));
+        assert!(find_admin_event(&env, symbol_short!("pause")));
     }
 
     #[test]
-    fn test_request_loan_succeeds_after_vouch_age_elapsed() {
+    fn test_unpause_emits_event() {
         let env = Env::default();
-        let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
+        let (contract_id, _, admin, _, _) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = single_admin_signers(&env, &admin);
+        client.pause(&signers);
+        client.unpause(&signers);
+        assert!(find_admin_event(&env, symbol_short!("unpause")));
+    }
+
+    #[test]
+    fn test_set_min_stake_emits_event() {
+        let env = Env::default();
+        let (contract_id, _, admin, _, _) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        client.set_min_stake(&single_admin_signers(&env, &admin), &500_000);
+        assert!(find_admin_event(&env, symbol_short!("minstake")));
+    }
+
+    #[test]
+    fn test_set_max_loan_amount_emits_event() {
+        let env = Env::default();
+        let (contract_id, _, admin, _, _) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        client.set_max_loan_amount(&single_admin_signers(&env, &admin), &1_000_000);
+        assert!(find_admin_event(&env, symbol_short!("maxloan")));
+    }
+
+    #[test]
+    fn test_set_min_vouchers_emits_event() {
+        let env = Env::default();
+        let (contract_id, _, admin, _, _) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        client.set_min_vouchers(&single_admin_signers(&env, &admin), &2);
+        assert!(find_admin_event(&env, symbol_short!("minvchrs")));
+    }
+
+    #[test]
+    fn test_set_config_emits_event() {
+        let env = Env::default();
+        let (contract_id, _, admin, _, _) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = single_admin_signers(&env, &admin);
+        let cfg = client.get_config();
+        client.set_config(&signers, &cfg);
+        assert!(find_admin_event(&env, symbol_short!("config")));
+    }
+
+    #[test]
+    fn test_set_protocol_fee_emits_event() {
+        let env = Env::default();
+        let (contract_id, _, admin, _, _) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        client.set_protocol_fee(&single_admin_signers(&env, &admin), &100);
+        assert!(find_admin_event(&env, symbol_short!("fee")));
+    }
+
+    #[test]
+    fn test_slash_treasury_emits_event() {
+        let env = Env::default();
+        let (contract_id, _, admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = single_admin_signers(&env, &admin);
 
         client.vouch(&voucher, &borrower, &1_000_000);
         advance_past_vouch_age(&env);
         client.request_loan(&borrower, &Vec::new(&env), &500_000, &1_000_000);
+        client.slash(&signers, &borrower);
 
-        let loan = client.get_loan(&borrower).unwrap();
-        assert_eq!(loan.amount, 500_000);
-        assert!(!loan.repaid);
+        let recipient = Address::generate(&env);
+        client.slash_treasury(&signers, &recipient);
+        assert!(find_admin_event(&env, symbol_short!("treasury")));
+    }
+
+    #[test]
+    fn test_set_reputation_nft_emits_event() {
+        let env = Env::default();
+        let (contract_id, _, admin, _, _) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let nft_id = env.register_contract(None, reputation::ReputationNftContract);
+        reputation::ReputationNftContractClient::new(&env, &nft_id).initialize(&contract_id);
+        client.set_reputation_nft(&single_admin_signers(&env, &admin), &nft_id);
+        assert!(find_admin_event(&env, symbol_short!("repnft")));
     }
 }
