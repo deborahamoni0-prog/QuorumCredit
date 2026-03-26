@@ -30,9 +30,10 @@ const DEFAULT_MIN_LOAN_AMOUNT: i128 = 100_000;
 const DEFAULT_LOAN_DURATION: u64 = 30 * 24 * 60 * 60;
 const DEFAULT_MAX_LOAN_TO_STAKE_RATIO: u32 = 150;
 const DEFAULT_VOUCH_COOLDOWN_SECS: u64 = 24 * 60 * 60; // 24 hours
-/// Minimum age (in seconds) a vouch must have before it can be used to back a loan.
-/// Prevents same-transaction or same-block vouch → request_loan attacks.
-const MIN_VOUCH_AGE: u64 = 60;
+/// Delay before a timelocked action can be executed (24 hours).
+const TIMELOCK_DELAY: u64 = 24 * 60 * 60;
+/// Window after eta during which the action can still be executed (72 hours).
+const TIMELOCK_EXPIRY: u64 = 72 * 60 * 60;
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -53,7 +54,9 @@ pub enum ContractError {
     InsufficientVouchers = 12,
     UnauthorizedCaller = 13,
     VouchCooldownActive = 14,
-    VouchTooRecent = 15,
+    TimelockNotReady = 15,
+    TimelockExpired = 16,
+    TimelockNotFound = 17,
 }
 
 // ── Loan Status ───────────────────────────────────────────────────────────────
@@ -90,6 +93,8 @@ pub enum DataKey {
     ProtocolFeeBps,          // u32: protocol fee in basis points
     FeeTreasury,             // Address: recipient of collected protocol fees
     LastVouchTimestamp(Address), // voucher → u64 last vouch timestamp
+    Timelock(u64),               // proposal_id → TimelockProposal
+    TimelockCounter,             // u64 monotonically increasing proposal ID
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -168,6 +173,26 @@ pub struct LoanPoolRecord {
     pub amounts: Vec<i128>,
     pub created_at: u64,
     pub total_disbursed: i128,
+}
+
+/// The action stored in a timelock proposal.
+#[contracttype]
+#[derive(Clone)]
+pub enum TimelockAction {
+    Slash(Address),    // borrower to slash
+    SetConfig(Config), // new protocol config
+}
+
+/// A pending timelocked admin action.
+#[contracttype]
+#[derive(Clone)]
+pub struct TimelockProposal {
+    pub id: u64,
+    pub action: TimelockAction,
+    pub proposer: Address,
+    pub eta: u64,      // earliest execution timestamp
+    pub executed: bool,
+    pub cancelled: bool,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -737,81 +762,11 @@ impl QuorumCreditContract {
     }
 
     /// Admin marks a loan defaulted; slash_bps% of each voucher's stake is slashed.
+    /// For non-emergency use, prefer propose_action(Slash) + execute_action for the timelock path.
     pub fn slash(env: Env, admin_signers: Vec<Address>, borrower: Address) {
         Self::require_admin_approval(&env, &admin_signers);
         Self::require_not_paused(&env).expect("contract is paused");
-        Self::slash_borrower(&env, &borrower);
-    }
-
-    /// Admin slashes multiple defaulters in a single transaction.
-    /// Reuses the same slash logic per borrower; panics on the first invalid borrower.
-    pub fn batch_slash(env: Env, admin_signers: Vec<Address>, borrowers: Vec<Address>) {
-        Self::require_admin_approval(&env, &admin_signers);
-        Self::require_not_paused(&env).expect("contract is paused");
-        for borrower in borrowers.iter() {
-            Self::slash_borrower(&env, &borrower);
-        }
-    }
-
-    fn slash_borrower(env: &Env, borrower: &Address) {
-        let mut loan: LoanRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Loan(borrower.clone()))
-            .expect("no active loan");
-
-        if loan.repaid || loan.defaulted {
-            panic_with_error!(env, ContractError::InvalidStateTransition);
-        }
-
-        let cfg = Self::config(env);
-        let vouches: Vec<VouchRecord> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Vouches(borrower.clone()))
-            .unwrap_or(Vec::new(env));
-
-        let token = Self::token(env);
-        let mut total_slashed: i128 = 0;
-        for v in vouches.iter() {
-            let slash_amount = v.stake * cfg.slash_bps / 10_000;
-            let returned = v.stake - slash_amount;
-            if returned > 0 {
-                token.transfer(&env.current_contract_address(), &v.voucher, &returned);
-            }
-            total_slashed += slash_amount;
-        }
-
-        let treasury: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::SlashTreasury)
-            .unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::SlashTreasury, &(treasury + total_slashed));
-
-        loan.defaulted = true;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Loan(borrower.clone()), &loan);
-
-        env.storage()
-            .persistent()
-            .remove(&DataKey::Vouches(borrower.clone()));
-
-        if let Some(nft_addr) = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::ReputationNft)
-        {
-            ReputationNftExternalClient::new(env, &nft_addr).burn(borrower);
-        }
-
-        env.events().publish(
-            (symbol_short!("loan"), symbol_short!("slashed")),
-            (borrower.clone(), loan.amount, total_slashed),
-        );
+        Self::do_slash(&env, borrower);
     }
 
     /// Allows vouchers to claim back their stake if loan has expired without repayment or slash.
@@ -879,6 +834,132 @@ impl QuorumCreditContract {
             (symbol_short!("admin"), symbol_short!("treasury")),
             (admin_signers.get(0).unwrap(), recipient, amount, env.ledger().timestamp()),
         );
+    }
+
+    // ── Timelock ──────────────────────────────────────────────────────────────
+
+    /// Propose a timelocked admin action. Returns the proposal ID.
+    /// The action can be executed after TIMELOCK_DELAY seconds have elapsed.
+    pub fn propose_action(
+        env: Env,
+        admin_signers: Vec<Address>,
+        action: TimelockAction,
+    ) -> u64 {
+        Self::require_admin_approval(&env, &admin_signers);
+
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TimelockCounter)
+            .unwrap_or(0u64)
+            .checked_add(1)
+            .expect("timelock ID overflow");
+        env.storage().instance().set(&DataKey::TimelockCounter, &id);
+
+        let eta = env.ledger().timestamp() + TIMELOCK_DELAY;
+        let proposer = admin_signers.get(0).unwrap();
+
+        env.storage().persistent().set(
+            &DataKey::Timelock(id),
+            &TimelockProposal {
+                id,
+                action: action.clone(),
+                proposer: proposer.clone(),
+                eta,
+                executed: false,
+                cancelled: false,
+            },
+        );
+
+        env.events().publish(
+            (symbol_short!("tl"), symbol_short!("proposed")),
+            (id, proposer, eta),
+        );
+        id
+    }
+
+    /// Execute a timelocked proposal once its eta has passed.
+    pub fn execute_action(
+        env: Env,
+        admin_signers: Vec<Address>,
+        proposal_id: u64,
+    ) -> Result<(), ContractError> {
+        Self::require_admin_approval(&env, &admin_signers);
+
+        let mut proposal: TimelockProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Timelock(proposal_id))
+            .ok_or(ContractError::TimelockNotFound)?;
+
+        assert!(!proposal.cancelled, "proposal cancelled");
+        assert!(!proposal.executed, "proposal already executed");
+
+        let now = env.ledger().timestamp();
+        if now < proposal.eta {
+            return Err(ContractError::TimelockNotReady);
+        }
+        if now > proposal.eta + TIMELOCK_EXPIRY {
+            return Err(ContractError::TimelockExpired);
+        }
+
+        proposal.executed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Timelock(proposal_id), &proposal);
+
+        match proposal.action.clone() {
+            TimelockAction::Slash(borrower) => {
+                Self::do_slash(&env, borrower);
+            }
+            TimelockAction::SetConfig(config) => {
+                env.storage().instance().set(&DataKey::Config, &config);
+                env.events().publish(
+                    (symbol_short!("admin"), symbol_short!("config")),
+                    (admin_signers.get(0).unwrap(), env.ledger().timestamp()),
+                );
+            }
+        }
+
+        env.events().publish(
+            (symbol_short!("tl"), symbol_short!("executed")),
+            (proposal_id, admin_signers.get(0).unwrap(), now),
+        );
+        Ok(())
+    }
+
+    /// Cancel a pending timelocked proposal before it is executed.
+    pub fn cancel_action(
+        env: Env,
+        admin_signers: Vec<Address>,
+        proposal_id: u64,
+    ) -> Result<(), ContractError> {
+        Self::require_admin_approval(&env, &admin_signers);
+
+        let mut proposal: TimelockProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Timelock(proposal_id))
+            .ok_or(ContractError::TimelockNotFound)?;
+
+        assert!(!proposal.executed, "proposal already executed");
+        assert!(!proposal.cancelled, "proposal already cancelled");
+
+        proposal.cancelled = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Timelock(proposal_id), &proposal);
+
+        env.events().publish(
+            (symbol_short!("tl"), symbol_short!("cancelled")),
+            (proposal_id, admin_signers.get(0).unwrap()),
+        );
+        Ok(())
+    }
+
+    /// Read a timelock proposal by ID.
+    pub fn get_proposal(env: Env, proposal_id: u64) -> Option<TimelockProposal> {
+        env.storage().persistent().get(&DataKey::Timelock(proposal_id))
     }
 
     /// Withdraw a vouch before any loan is active, returning the exact stake to the voucher.
@@ -1736,6 +1817,67 @@ impl QuorumCreditContract {
 
     fn token_client(env: &Env) -> token::Client<'_> {
         Self::token(env)
+    }
+
+    /// Core slash logic shared by `slash` (direct) and `execute_action` (timelocked).
+    fn do_slash(env: &Env, borrower: Address) {
+        let mut loan: LoanRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Loan(borrower.clone()))
+            .expect("no active loan");
+
+        if loan.repaid || loan.defaulted {
+            panic_with_error!(env, ContractError::NoActiveLoan);
+        }
+
+        let cfg = Self::config(env);
+        let vouches: Vec<VouchRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Vouches(borrower.clone()))
+            .unwrap_or(Vec::new(env));
+
+        loan.defaulted = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Loan(borrower.clone()), &loan);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Vouches(borrower.clone()));
+
+        let token = Self::token(env);
+        let mut total_slashed: i128 = 0;
+        for v in vouches.iter() {
+            let slash_amount = v.stake * cfg.slash_bps / 10_000;
+            let returned = v.stake - slash_amount;
+            if returned > 0 {
+                token.transfer(&env.current_contract_address(), &v.voucher, &returned);
+            }
+            total_slashed += slash_amount;
+        }
+
+        let treasury: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SlashTreasury)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::SlashTreasury, &(treasury + total_slashed));
+
+        if let Some(nft_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::ReputationNft)
+        {
+            ReputationNftExternalClient::new(env, &nft_addr).burn(&borrower);
+        }
+
+        env.events().publish(
+            (symbol_short!("loan"), symbol_short!("slashed")),
+            (borrower, loan.amount, total_slashed),
+        );
     }
 
     fn require_admin_approval(env: &Env, admin_signers: &Vec<Address>) {
@@ -3853,5 +3995,171 @@ mod tests {
         reputation::ReputationNftContractClient::new(&env, &nft_id).initialize(&contract_id);
         client.set_reputation_nft(&single_admin_signers(&env, &admin), &nft_id);
         assert!(find_admin_event(&env, symbol_short!("repnft")));
+    }
+
+    // ── Timelock Tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_propose_action_creates_proposal_with_correct_eta() {
+        let env = Env::default();
+        let (contract_id, _, admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = single_admin_signers(&env, &admin);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+
+        let now = env.ledger().timestamp();
+        let id = client.propose_action(&signers, &TimelockAction::Slash(borrower.clone()));
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert_eq!(proposal.id, id);
+        assert_eq!(proposal.eta, now + TIMELOCK_DELAY);
+        assert!(!proposal.executed);
+        assert!(!proposal.cancelled);
+    }
+
+    #[test]
+    fn test_execute_action_slash_before_eta_rejected() {
+        let env = Env::default();
+        let (contract_id, _, admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = single_admin_signers(&env, &admin);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        advance_past_vouch_age(&env);
+        client.request_loan(&borrower, &Vec::new(&env), &500_000, &1_000_000);
+
+        let id = client.propose_action(&signers, &TimelockAction::Slash(borrower.clone()));
+
+        // Try to execute immediately — must fail.
+        let result = client.try_execute_action(&signers, &id);
+        assert_eq!(result, Err(Ok(ContractError::TimelockNotReady)));
+    }
+
+    #[test]
+    fn test_execute_action_slash_after_eta_succeeds() {
+        let env = Env::default();
+        let (contract_id, token_addr, admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let token = soroban_sdk::token::Client::new(&env, &token_addr);
+        let signers = single_admin_signers(&env, &admin);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        advance_past_vouch_age(&env);
+        client.request_loan(&borrower, &Vec::new(&env), &500_000, &1_000_000);
+
+        let id = client.propose_action(&signers, &TimelockAction::Slash(borrower.clone()));
+
+        // Advance past the timelock delay.
+        env.ledger().set_timestamp(env.ledger().timestamp() + TIMELOCK_DELAY);
+        client.execute_action(&signers, &id);
+
+        assert!(client.get_loan(&borrower).unwrap().defaulted);
+        assert_eq!(token.balance(&voucher), 9_500_000); // 50% slashed
+        let proposal = client.get_proposal(&id).unwrap();
+        assert!(proposal.executed);
+    }
+
+    #[test]
+    fn test_execute_action_set_config_after_eta_succeeds() {
+        let env = Env::default();
+        let (contract_id, _, admin, _, _) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = single_admin_signers(&env, &admin);
+
+        let mut new_cfg = client.get_config();
+        new_cfg.yield_bps = 300;
+
+        let id = client.propose_action(&signers, &TimelockAction::SetConfig(new_cfg.clone()));
+        env.ledger().set_timestamp(env.ledger().timestamp() + TIMELOCK_DELAY);
+        client.execute_action(&signers, &id);
+
+        assert_eq!(client.get_config().yield_bps, 300);
+    }
+
+    #[test]
+    fn test_execute_action_after_expiry_rejected() {
+        let env = Env::default();
+        let (contract_id, _, admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = single_admin_signers(&env, &admin);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        advance_past_vouch_age(&env);
+        client.request_loan(&borrower, &Vec::new(&env), &500_000, &1_000_000);
+
+        let id = client.propose_action(&signers, &TimelockAction::Slash(borrower.clone()));
+
+        // Advance past eta + expiry window.
+        env.ledger().set_timestamp(
+            env.ledger().timestamp() + TIMELOCK_DELAY + TIMELOCK_EXPIRY + 1,
+        );
+        let result = client.try_execute_action(&signers, &id);
+        assert_eq!(result, Err(Ok(ContractError::TimelockExpired)));
+    }
+
+    #[test]
+    fn test_cancel_action_prevents_execution() {
+        let env = Env::default();
+        let (contract_id, _, admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = single_admin_signers(&env, &admin);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        let id = client.propose_action(&signers, &TimelockAction::Slash(borrower.clone()));
+
+        client.cancel_action(&signers, &id);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert!(proposal.cancelled);
+    }
+
+    #[test]
+    #[should_panic(expected = "proposal cancelled")]
+    fn test_execute_cancelled_proposal_panics() {
+        let env = Env::default();
+        let (contract_id, _, admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = single_admin_signers(&env, &admin);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        let id = client.propose_action(&signers, &TimelockAction::Slash(borrower.clone()));
+        client.cancel_action(&signers, &id);
+
+        env.ledger().set_timestamp(env.ledger().timestamp() + TIMELOCK_DELAY);
+        client.execute_action(&signers, &id);
+    }
+
+    #[test]
+    fn test_propose_emits_event() {
+        use soroban_sdk::{IntoVal, Val};
+        let env = Env::default();
+        let (contract_id, _, admin, borrower, _) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = single_admin_signers(&env, &admin);
+
+        client.propose_action(&signers, &TimelockAction::Slash(borrower));
+
+        let topic_tl: Val = symbol_short!("tl").into_val(&env);
+        let topic_proposed: Val = symbol_short!("proposed").into_val(&env);
+        let found = env.events().all().iter().any(|(_, topics, _)| {
+            topics.len() == 2
+                && topics.get_unchecked(0).get_payload() == topic_tl.get_payload()
+                && topics.get_unchecked(1).get_payload() == topic_proposed.get_payload()
+        });
+        assert!(found, "tl/proposed event not emitted");
+    }
+
+    #[test]
+    #[should_panic(expected = "insufficient admin approvals")]
+    fn test_propose_action_requires_admin() {
+        let env = Env::default();
+        let (contract_id, _, _admin, borrower, _) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let outsider = Address::generate(&env);
+        client.propose_action(
+            &single_admin_signers(&env, &outsider),
+            &TimelockAction::Slash(borrower),
+        );
     }
 }
