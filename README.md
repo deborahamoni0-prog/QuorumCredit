@@ -4,6 +4,8 @@
 
 Platform: Stellar Soroban | Language: Rust | License: MIT
 
+[![codecov](https://codecov.io/gh/your-org/QuorumCredit/branch/main/graph/badge.svg)](https://codecov.io/gh/your-org/QuorumCredit)
+
 ---
 
 ## About
