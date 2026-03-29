@@ -511,7 +511,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "DuplicateVouch")]
     fn test_duplicate_vouch_from_same_voucher_rejected() {
-    fn test_vouch_blacklisted_borrower() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -520,7 +519,6 @@ mod tests {
 
         let deployer = Address::generate(&env);
         let admin = create_test_admin(&env);
-        let admins = Vec::from_array(&env, [admin]);
         let admins = Vec::from_array(&env, [admin.clone()]);
         let token = create_test_token(&env);
 
@@ -534,6 +532,25 @@ mod tests {
 
         // Second vouch from same voucher for same borrower should panic with DuplicateVouch
         client.vouch(&voucher, &borrower, &2000, &token);
+    }
+
+    #[test]
+    fn test_vouch_blacklisted_borrower() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, QuorumCreditContract);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+        let admin = create_test_admin(&env);
+        let admins = Vec::from_array(&env, [admin.clone()]);
+        let token = create_test_token(&env);
+
+        client.initialize(&deployer, &admins, &1, &token);
+
+        let voucher = Address::generate(&env);
+        let borrower = Address::generate(&env);
         let stake = 1_000_000;
 
         // Blacklist the borrower
