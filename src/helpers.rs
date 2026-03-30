@@ -1,5 +1,5 @@
 use crate::errors::ContractError;
-use crate::types::{Config, DataKey, LoanRecord};
+use crate::types::{Config, DataKey, LoanRecord, BPS_DENOMINATOR};
 use soroban_sdk::{token, Address, Env, String, Vec};
 
 /// Returns true if the address is the all-zeros account or contract address.
@@ -187,7 +187,7 @@ pub fn validate_admin_config(
     Ok(())
 }
 
-/// Compute basis points: amount * bps / 10_000
+/// Compute basis points: amount * bps / BPS_DENOMINATOR
 pub fn bps_of(amount: i128, bps: u32) -> i128 {
-    amount * bps as i128 / 10_000
+    amount * bps as i128 / BPS_DENOMINATOR
 }

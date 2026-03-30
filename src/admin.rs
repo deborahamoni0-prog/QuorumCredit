@@ -1,5 +1,5 @@
 use crate::helpers::{config, require_admin_approval, validate_admin_config};
-use crate::types::{Config, DataKey};
+use crate::types::{Config, DataKey, BPS_DENOMINATOR};
 use soroban_sdk::{symbol_short, Address, BytesN, Env, Vec};
 
 pub fn add_admin(env: Env, admin_signers: Vec<Address>, new_admin: Address) {
@@ -103,7 +103,10 @@ pub fn set_admin_threshold(env: Env, admin_signers: Vec<Address>, new_threshold:
 
 pub fn set_protocol_fee(env: Env, admin_signers: Vec<Address>, fee_bps: u32) {
     require_admin_approval(&env, &admin_signers);
-    assert!(fee_bps <= 10_000, "fee_bps must not exceed 10000");
+    assert!(
+        fee_bps <= BPS_DENOMINATOR as u32,
+        "fee_bps must not exceed 10000"
+    );
     env.storage()
         .instance()
         .set(&DataKey::ProtocolFeeBps, &fee_bps);
@@ -181,7 +184,7 @@ pub fn set_config(env: Env, admin_signers: Vec<Address>, config: Config) {
         .expect("invalid admin config");
     assert!(config.yield_bps >= 0, "yield_bps must be non-negative");
     assert!(
-        config.slash_bps > 0 && config.slash_bps <= 10_000,
+        config.slash_bps > 0 && config.slash_bps <= BPS_DENOMINATOR,
         "slash_bps must be 1-10000"
     );
     assert!(
@@ -224,7 +227,7 @@ pub fn update_config(
 
     if let Some(new_slash_bps) = slash_bps {
         assert!(
-            new_slash_bps > 0 && new_slash_bps <= 10_000,
+            new_slash_bps > 0 && new_slash_bps <= BPS_DENOMINATOR,
             "slash_bps must be 1-10000"
         );
         cfg.slash_bps = new_slash_bps;

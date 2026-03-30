@@ -295,7 +295,10 @@ impl QuorumCreditContract {
     /// * If bonus_bps exceeds 10000
     pub fn set_referral_bonus_bps(env: Env, admin_signers: Vec<Address>, bonus_bps: u32) {
         helpers::require_admin_approval(&env, &admin_signers);
-        assert!(bonus_bps <= 10_000, "bonus_bps must not exceed 10000");
+        assert!(
+            bonus_bps <= BPS_DENOMINATOR as u32,
+            "bonus_bps must not exceed 10000"
+        );
         env.storage()
             .instance()
             .set(&DataKey::ReferralBonusBps, &bonus_bps);

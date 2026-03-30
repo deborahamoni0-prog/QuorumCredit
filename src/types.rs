@@ -6,6 +6,7 @@ use soroban_sdk::{contracttype, Address, Vec};
 
 pub const DEFAULT_YIELD_BPS: i128 = 200;
 pub const DEFAULT_SLASH_BPS: i128 = 5000;
+pub const BPS_DENOMINATOR: i128 = 10_000;
 pub const DEFAULT_MIN_YIELD_STAKE: i128 = 50;
 pub const DEFAULT_REFERRAL_BONUS_BPS: u32 = 100; // 1% of loan amount
 pub const MIN_VOUCH_AGE: u64 = 60; // 1 minute
@@ -57,7 +58,7 @@ pub enum DataKey {
     ProtocolFeeBps,  // u32: protocol fee in basis points
     FeeTreasury,     // Address: recipient of collected protocol fees
     LastVouchTimestamp(Address), // voucher → u64 last vouch timestamp
-    VouchCooldownSecs,           // u64 cooldown between vouch calls (default 24 hours)
+    VouchCooldownSecs, // u64 cooldown between vouch calls (default 24 hours)
     Timelock(u64),   // proposal_id → TimelockProposal
     TimelockCounter, // u64 monotonically increasing proposal ID
     Blacklisted(Address), // borrower → bool permanently banned
