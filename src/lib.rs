@@ -720,6 +720,22 @@ impl QuorumCreditContract {
             .unwrap_or(0)
     }
 
+    /// Withdraw funds from the slash treasury to a recipient address.
+    /// Admin-gated. Emits an admin/slshwdraw event on success.
+    ///
+    /// # Arguments
+    /// * `admin_signers` - Vector of admin addresses (must meet threshold)
+    /// * `recipient` - Address to receive the withdrawn funds
+    /// * `amount` - Amount to withdraw in stroops (must be > 0)
+    pub fn withdraw_slash_treasury(
+        env: Env,
+        admin_signers: Vec<Address>,
+        recipient: Address,
+        amount: i128,
+    ) {
+        admin::withdraw_slash_treasury(env, admin_signers, recipient, amount)
+    }
+
     /// Check if the contract is paused.
     ///
     /// # Returns
