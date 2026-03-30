@@ -1,6 +1,8 @@
 use crate::errors::ContractError;
-use crate::helpers::{add_slash_balance, config, get_active_loan_record, require_not_paused};
-use crate::types::{DataKey, SlashVoteRecord, TimelockAction, TimelockProposal, VouchRecord};
+use crate::helpers::{
+    add_slash_balance, config, get_active_loan_record, get_latest_loan_record, require_not_paused,
+};
+use crate::types::{DataKey, LoanStatus, SlashVoteRecord, TimelockAction, TimelockProposal, VouchRecord};
 use soroban_sdk::{symbol_short, Address, Env, Vec};
 
 /// Default quorum: 50% of total vouched stake must approve.
@@ -19,6 +21,14 @@ pub fn vote_slash(
 ) -> Result<(), ContractError> {
     voucher.require_auth();
     require_not_paused(&env)?;
+
+    // If the borrower's latest loan is already repaid, panic with a clear message.
+    if let Some(latest) = get_latest_loan_record(&env, &borrower) {
+        assert!(
+            latest.status != LoanStatus::Repaid,
+            "loan already repaid"
+        );
+    }
 
     // Borrower must have an active loan to be slashable.
     let loan = get_active_loan_record(&env, &borrower)?;
