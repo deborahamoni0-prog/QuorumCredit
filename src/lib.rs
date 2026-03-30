@@ -66,8 +66,7 @@ mod is_eligible_token_filter_test;
 #[cfg(test)]
 mod vote_slash_auto_execute_test;
 
-pub use errors::ContractError;
-pub use types::*;
+// ── Storage Keys ──────────────────────────────────────────────────────────────
 
 use helpers::{require_valid_token, validate_admin_config};
 use reputation::ReputationNftExternalClient;
@@ -90,9 +89,6 @@ impl QuorumCreditContract {
         if env.storage().instance().has(&DataKey::Config) {
             panic_with_error!(&env, ContractError::AlreadyInitialized);
         }
-
-        validate_admin_config(&env, &admins, admin_threshold)?;
-        require_valid_token(&env, &token)?;
 
         env.storage().instance().set(&DataKey::Deployer, &deployer);
         env.storage().instance().set(
@@ -309,9 +305,10 @@ impl QuorumCreditContract {
     /// * `u32` - The referral bonus in basis points
     pub fn get_referral_bonus_bps(env: Env) -> u32 {
         env.storage()
-            .instance()
-            .get(&DataKey::ReferralBonusBps)
-            .unwrap_or(crate::types::DEFAULT_REFERRAL_BONUS_BPS)
+            .persistent()
+            .set(&DataKey::Vouches(borrower), &vouches);
+        
+        Ok(())
     }
 
     /// Request a loan from the protocol.
@@ -343,8 +340,6 @@ impl QuorumCreditContract {
         borrower: Address,
         amount: i128,
         threshold: i128,
-        loan_purpose: soroban_sdk::String,
-        token: Address,
     ) -> Result<(), ContractError> {
         loan::request_loan(env, borrower, amount, threshold, loan_purpose, token)
     }
@@ -717,10 +712,8 @@ impl QuorumCreditContract {
     /// * `i128` - The slash treasury balance in stroops
     pub fn get_slash_treasury_balance(env: Env) -> i128 {
         env.storage()
-            .instance()
-            .get(&DataKey::SlashTreasury)
-            .unwrap_or(0)
-    }
+            .persistent()
+            .set(&DataKey::Loan(borrower.clone()), &loan);
 
     /// Withdraw funds from the slash treasury to a recipient address.
     /// Admin-gated. Emits an admin/slshwdraw event on success.
@@ -744,9 +737,8 @@ impl QuorumCreditContract {
     /// * `bool` - True if paused, false otherwise
     pub fn get_paused(env: Env) -> bool {
         env.storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
+            .persistent()
+            .set(&DataKey::Credit(borrower), &credit);
     }
 
     /// Get the loan status for a borrower.
@@ -860,13 +852,11 @@ impl QuorumCreditContract {
         let nft_addr: Address = match env
             .storage()
             .instance()
-            .get::<DataKey, Address>(&DataKey::ReputationNft)
-        {
-            Some(a) => a,
-            None => return 0,
-        };
-        ReputationNftExternalClient::new(&env, &nft_addr).balance(&borrower)
+            .get(&DataKey::Token)
+            .expect("not initialized");
+        token::Client::new(env, &addr)
     }
+}
 
     /// Get the total amount vouched for a borrower.
     ///
@@ -989,14 +979,7 @@ impl QuorumCreditContract {
         admin::get_max_vouchers_per_borrower(env)
     }
 
-    /// Issue 109: Propose a slash action with a confirmation window (timelock delay).
-    pub fn propose_slash(
-        env: Env,
-        proposer: Address,
-        borrower: Address,
-        delay_secs: u64,
-    ) -> Result<u64, ContractError> {
-        governance::propose_slash(env, proposer, borrower, delay_secs)
+        assert_eq!(token.balance(&voucher), 10_020_000);
     }
 
     /// Issue 109: Execute a previously proposed slash after the delay has passed.
