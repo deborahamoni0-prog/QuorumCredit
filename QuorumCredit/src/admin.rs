@@ -348,3 +348,77 @@ pub fn get_protocol_fee(env: Env) -> u32 {
         .get(&DataKey::ProtocolFeeBps)
         .unwrap_or(0)
 }
+
+/// ─────────────────────────────────────────────
+/// ADMIN DELEGATION (#684)
+/// ─────────────────────────────────────────────
+
+pub fn delegate_permission(
+    env: Env,
+    admin_signers: Vec<Address>,
+    delegatee: Address,
+    permissions: Vec<soroban_sdk::String>,
+) {
+    require_admin_approval(&env, &admin_signers);
+
+    let record = crate::types::AdminDelegationRecord { permissions };
+    env.storage()
+        .persistent()
+        .set(&DataKey::AdminDelegation(delegatee.clone()), &record);
+
+    extend_ttl(&env, &DataKey::AdminDelegation(delegatee.clone()));
+
+    log_admin_action(&env, &admin_signers.get(0).unwrap(), "delegate_permission");
+
+    env.events()
+        .publish((symbol_short!("admin"), symbol_short!("deleg")), delegatee);
+}
+
+pub fn revoke_delegation(env: Env, admin_signers: Vec<Address>, delegatee: Address) {
+    require_admin_approval(&env, &admin_signers);
+
+    env.storage()
+        .persistent()
+        .remove(&DataKey::AdminDelegation(delegatee.clone()));
+
+    log_admin_action(&env, &admin_signers.get(0).unwrap(), "revoke_delegation");
+
+    env.events()
+        .publish((symbol_short!("admin"), symbol_short!("revoke")), delegatee);
+}
+
+pub fn whitelist_voucher_delegated(env: Env, caller: Address, voucher: Address) {
+    caller.require_auth();
+
+    assert!(
+        helpers::has_delegated_permission(&env, &caller, &soroban_sdk::String::from_str(&env, "whitelist_voucher")),
+        "caller does not have whitelist_voucher permission"
+    );
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::VoucherWhitelist(voucher.clone()), &true);
+
+    extend_ttl(&env, &DataKey::VoucherWhitelist(voucher));
+}
+
+/// ─────────────────────────────────────────────
+/// VETO ADMIN (#685)
+/// ─────────────────────────────────────────────
+
+pub fn set_veto_admin(
+    env: Env,
+    admin_signers: Vec<Address>,
+    veto_admin: Option<Address>,
+) {
+    require_admin_approval(&env, &admin_signers);
+
+    let mut cfg = config(&env);
+    cfg.veto_admin = veto_admin.clone();
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    log_admin_action(&env, &admin_signers.get(0).unwrap(), "set_veto_admin");
+
+    env.events()
+        .publish((symbol_short!("admin"), symbol_short!("vetoadm")), veto_admin);
+}
