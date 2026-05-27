@@ -57,4 +57,8 @@ pub enum ContractError {
     WithdrawalNotQueued = 47,
     /// Partial withdrawal amount exceeds the 50% cap.
     PartialWithdrawalExceedsCap = 48,
+    /// Borrower has used all allowed deferment periods.
+    DefermentLimitReached = 49,
+    /// Loan has been accelerated due to a trigger condition.
+    LoanAccelerated = 50,
 }

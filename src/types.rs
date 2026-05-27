@@ -69,6 +69,12 @@ pub const DECREASE_STAKE_TIMELOCK: u64 = 7 * 24 * 60 * 60;
 /// Withdrawal request timelock delay, in seconds (24 hours).
 pub const WITHDRAWAL_TIMELOCK_DELAY: u64 = 24 * 60 * 60;
 
+/// Maximum number of deferment periods allowed per loan.
+pub const MAX_DEFERMENT_PERIODS: u32 = 3;
+
+/// Duration of each deferment period, in seconds (30 days).
+pub const DEFERMENT_PERIOD_SECS: u64 = 30 * 24 * 60 * 60;
+
 /// Penalty applied to partial mid-loan withdrawals, in basis points (1000 = 10%).
 pub const PARTIAL_WITHDRAWAL_PENALTY_BPS: i128 = 1_000;
 
@@ -275,6 +281,8 @@ pub struct LoanRecord {
     pub reminder_sent: bool,
     /// Risk score for the borrower (0-100), used for dynamic yield calculation.
     pub risk_score: u32,
+    /// Number of payment deferment periods used on this loan.
+    pub deferment_periods: u32,
 }
 
 /// A single payment event recorded against a loan.

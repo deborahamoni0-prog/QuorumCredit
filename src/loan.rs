@@ -6,7 +6,7 @@ use crate::helpers::{
 use crate::reputation::ReputationNftExternalClient;
 use crate::types::{
     DataKey, LoanRecord, LoanStatus, VouchRecord, BPS_DENOMINATOR,
-    DEFAULT_REFERRAL_BONUS_BPS, SLASH_ESCROW_PERIOD,
+    DEFAULT_REFERRAL_BONUS_BPS, SLASH_ESCROW_PERIOD, MAX_DEFERMENT_PERIODS, DEFERMENT_PERIOD_SECS,
 };
 use soroban_sdk::{panic_with_error, symbol_short, Address, Env, Vec};
 
@@ -92,6 +92,7 @@ pub fn request_loan(
         amortization_schedule: Vec::new(&env),
         reminder_sent: false,
         risk_score: 0,
+        deferment_periods: 0,
     };
 
     env.storage().persistent().set(&DataKey::Loan(loan_id), &loan);
@@ -320,6 +321,31 @@ pub fn set_borrower_risk_score(
     env.storage()
         .persistent()
         .set(&DataKey::Loan(loan.id), &loan);
+
+    Ok(())
+}
+
+/// Defer the next payment, extending the loan deadline by one deferment period.
+/// Limited to `MAX_DEFERMENT_PERIODS` per loan.
+pub fn defer_payment(env: Env, borrower: Address) -> Result<(), ContractError> {
+    borrower.require_auth();
+    require_not_paused(&env)?;
+
+    let mut loan = get_active_loan_record(&env, &borrower)?;
+
+    if loan.deferment_periods >= MAX_DEFERMENT_PERIODS {
+        return Err(ContractError::DefermentLimitReached);
+    }
+
+    loan.deadline += DEFERMENT_PERIOD_SECS;
+    loan.deferment_periods += 1;
+
+    env.storage().persistent().set(&DataKey::Loan(loan.id), &loan);
+
+    env.events().publish(
+        (symbol_short!(\"loan\"), symbol_short!(\"deferred\")),
+        (borrower, loan.deferment_periods),
+    );
 
     Ok(())
 }

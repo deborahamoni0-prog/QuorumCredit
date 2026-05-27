@@ -227,6 +227,7 @@ impl QuorumCreditContract {
             amortization_schedule: Vec::new(&env),
             reminder_sent: false,
             risk_score: 0,
+            deferment_periods: 0,
         };
 
         env.storage()

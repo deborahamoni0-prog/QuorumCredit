@@ -1474,6 +1474,12 @@ impl QuorumCreditContract {
 
     // ── Issue #601: Loan Extension / Refinancing ──────────────────────────────
 
+    /// Defer the next payment, extending the loan deadline by one deferment period.
+    /// Limited to `MAX_DEFERMENT_PERIODS` (3) per loan.
+    pub fn defer_payment(env: Env, borrower: Address) -> Result<(), ContractError> {
+        loan::defer_payment(env, borrower)
+    }
+
     /// Request a loan extension. Requires voucher approval.
     ///
     /// The borrower requests an extension of their active loan deadline. Vouchers must
