@@ -11,6 +11,7 @@ pub mod fraud_detection;
 pub mod governance;
 pub mod health;
 pub mod helpers;
+pub mod key_manager;
 pub mod liquidity_mining;
 pub mod loan;
 pub mod reputation;

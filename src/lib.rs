@@ -4,6 +4,7 @@ mod admin;
 mod errors;
 mod governance;
 mod helpers;
+mod key_manager;
 mod secure_delete;
 mod types;
 mod vouch;

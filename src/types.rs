@@ -253,6 +253,8 @@ pub enum DataKey {
     ExternalCreditScore(Address),
     // #666: Escrowed repayment amount per borrower (held pending oracle verification)
     EscrowAmount(Address),
+    // #704: Managed derived key storage
+    ManagedKey(soroban_sdk::BytesN<32>),
 }
 
 // ── Governance ────────────────────────────────────────────────────────────────
