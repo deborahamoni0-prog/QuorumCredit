@@ -1,15 +1,32 @@
+use crate::errors::ContractError;
 use crate::helpers::{
     config, is_admin, require_admin_approval, require_not_paused, require_valid_token,
     validate_admin_config,
 };
-use crate::types::{Config, ConfigUpdateKey, ConfigUpdateProposal, DataKey, AdminActionProposal};
+use crate::types::{AdminActionProposal, Config, ConfigUpdateKey, ConfigUpdateProposal, DataKey};
 use soroban_sdk::{panic_with_error, symbol_short, Address, BytesN, Env, Vec};
-use crate::errors::ContractError;
+
+fn validate_admin_member(env: &Env, admin: &Address, config: &Config) {
+    if !config.admin_whitelist.is_empty()
+        && !config.admin_whitelist.iter().any(|allowed| allowed == *admin)
+    {
+        panic_with_error!(&env, ContractError::AdminNotWhitelisted);
+    }
+    if config
+        .admin_blacklist
+        .iter()
+        .any(|blocked| blocked == *admin)
+    {
+        panic_with_error!(&env, ContractError::AdminBlacklisted);
+    }
+}
 
 pub fn add_admin(env: Env, admin_signers: Vec<Address>, new_admin: Address) {
     require_admin_approval(&env, &admin_signers);
 
     let mut cfg = config(&env);
+
+    validate_admin_member(&env, &new_admin, &cfg);
 
     if cfg.admins.iter().any(|a| a == new_admin) {
         panic_with_error!(&env, ContractError::AlreadyInitialized);
@@ -66,6 +83,8 @@ pub fn rotate_admin(env: Env, admin_signers: Vec<Address>, old_admin: Address, n
 
     let mut cfg = config(&env);
 
+    validate_admin_member(&env, &new_admin, &cfg);
+
     if cfg.admins.iter().any(|a| a == new_admin) {
         panic_with_error!(&env, ContractError::AlreadyInitialized);
     }
@@ -103,6 +122,92 @@ pub fn set_admin_threshold(env: Env, admin_signers: Vec<Address>, new_threshold:
     env.events().publish(
         (symbol_short!("admin"), symbol_short!("thresh")),
         new_threshold,
+    );
+}
+
+/// Issue #688: Add an address to the admin whitelist.
+pub fn add_to_admin_whitelist(env: Env, admin_signers: Vec<Address>, address: Address) {
+    require_admin_approval(&env, &admin_signers);
+
+    let mut cfg = config(&env);
+
+    if cfg.admin_whitelist.iter().any(|a| a == address) {
+        panic_with_error!(&env, ContractError::AlreadyInitialized);
+    }
+    if cfg.admin_blacklist.iter().any(|a| a == address) {
+        panic_with_error!(&env, ContractError::AdminBlacklisted);
+    }
+
+    cfg.admin_whitelist.push_back(address.clone());
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("wl_add")),
+        address,
+    );
+}
+
+/// Issue #688: Remove an address from the admin whitelist.
+pub fn remove_from_admin_whitelist(env: Env, admin_signers: Vec<Address>, address: Address) {
+    require_admin_approval(&env, &admin_signers);
+
+    let mut cfg = config(&env);
+
+    let idx = cfg
+        .admin_whitelist
+        .iter()
+        .position(|a| a == address)
+        .expect("address not in whitelist") as u32;
+
+    cfg.admin_whitelist.remove(idx);
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("wl_rm")),
+        address,
+    );
+}
+
+/// Issue #689: Add an address to the admin blacklist.
+pub fn add_to_admin_blacklist(env: Env, admin_signers: Vec<Address>, address: Address) {
+    require_admin_approval(&env, &admin_signers);
+
+    let mut cfg = config(&env);
+
+    if cfg.admin_blacklist.iter().any(|a| a == address) {
+        panic_with_error!(&env, ContractError::AlreadyInitialized);
+    }
+    if cfg.admin_whitelist.iter().any(|a| a == address) {
+        panic_with_error!(&env, ContractError::AdminNotWhitelisted);
+    }
+
+    cfg.admin_blacklist.push_back(address.clone());
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("bl_add")),
+        address,
+    );
+}
+
+/// Issue #689: Remove an address from the admin blacklist.
+pub fn remove_from_admin_blacklist(env: Env, admin_signers: Vec<Address>, address: Address) {
+    require_admin_approval(&env, &admin_signers);
+
+    let mut cfg = config(&env);
+
+    let idx = cfg
+        .admin_blacklist
+        .iter()
+        .position(|a| a == address)
+        .expect("address not in blacklist") as u32;
+
+    cfg.admin_blacklist.remove(idx);
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("bl_rm")),
+        address,
     );
 }
 
@@ -221,8 +326,14 @@ pub fn blacklist(env: Env, admin_signers: Vec<Address>, borrower: Address) {
 pub fn set_config(env: Env, admin_signers: Vec<Address>, config: Config) {
     require_not_paused(&env).expect("contract paused");
     require_admin_approval(&env, &admin_signers);
-    validate_admin_config(&env, &config.admins, config.admin_threshold)
-        .expect("invalid admin config");
+    validate_admin_config(
+        &env,
+        &config.admins,
+        config.admin_threshold,
+        &config.admin_whitelist,
+        &config.admin_blacklist,
+    )
+    .expect("invalid admin config");
     if config.yield_bps < 0 || config.yield_bps > 10_000 {
         panic_with_error!(&env, ContractError::InvalidBps);
     }
@@ -643,6 +754,55 @@ pub fn accept_admin(env: Env) -> Result<(), ContractError> {
     env.events().publish(
         (symbol_short!("admin"), symbol_short!("accepted")),
         new_admin,
+    );
+
+    Ok(())
+}
+
+/// Designate a successor admin who can claim admin rights without multi-sig approval.
+/// Only the current admin set can designate a successor. Pass `None` to clear.
+pub fn set_successor_admin(
+    env: Env,
+    admin_signers: Vec<Address>,
+    successor: Option<Address>,
+) {
+    require_admin_approval(&env, &admin_signers);
+
+    if let Some(ref addr) = successor {
+        if is_admin(&env, addr) {
+            panic_with_error!(&env, ContractError::AlreadyInitialized);
+        }
+    }
+
+    let mut cfg = config(&env);
+    cfg.successor_admin = successor.clone();
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("successor")),
+        (admin_signers.get(0).unwrap(), successor),
+    );
+}
+
+/// Claim admin rights as the designated successor admin.
+/// The caller must match the stored `successor_admin` address and authenticate.
+/// On success, the caller is added to the admin list and the successor slot is cleared.
+pub fn claim_successor_admin(env: Env) -> Result<(), ContractError> {
+    let mut cfg = config(&env);
+    let successor = cfg
+        .successor_admin
+        .clone()
+        .ok_or(ContractError::UnauthorizedCaller)?;
+
+    successor.require_auth();
+
+    cfg.admins.push_back(successor.clone());
+    cfg.successor_admin = None;
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("cl_succ")),
+        successor,
     );
 
     Ok(())

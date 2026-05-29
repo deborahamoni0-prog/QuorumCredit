@@ -359,6 +359,11 @@ pub struct ConfigUpdateProposal {
 pub struct Config {
     pub admins: Vec<Address>,
     pub admin_threshold: u32,
+    /// Admin addresses that are permitted to be configured as admins.
+    /// If empty, any valid admin address may be used.
+    pub admin_whitelist: Vec<Address>,
+    /// Admin addresses that are explicitly forbidden from being configured as admins.
+    pub admin_blacklist: Vec<Address>,
     /// Primary token contract address used for loans and vouches.
     pub token: Address,
     /// Additional token contract addresses accepted for loans/vouches.
@@ -398,28 +403,9 @@ pub struct Config {
     pub oracle_address: Option<soroban_sdk::Address>,
     /// Delay (in seconds) after a slash vote reaches quorum before it can be executed (0 = immediate).
     pub slash_delay_seconds: u64,
-    /// When true, each repayment must be preceded by a `confirm_repayment` call from the borrower.
-    pub confirmation_required: bool,
-    /// Controls where redistributable slash funds flow after insurance allocation.
-    pub redistribution_rule: RedistributionRule,
-    /// Fraction of slash proceeds returned to the borrower on full repayment, in basis points.
-    pub recovery_percentage: u32,
-    /// Seconds a borrower is immune from re-slashing after a reversal (0 = no immunity).
-    pub immunity_period_seconds: u64,
-    /// Protocol fee charged on disbursement and routed to the insurance pool, in basis points.
-    pub insurance_premium_bps: u32,
-    /// When true, the slash threshold adjusts dynamically based on protocol health.
-    pub dynamic_slash_threshold: bool,
-    /// When true, slash penalty scales linearly with loan size relative to total staked collateral.
-    pub loan_size_slash_enabled: bool,
-    /// Maximum slash rate applied to the largest loans when loan-size scaling is enabled, in bps.
-    pub loan_size_slash_max_bps: i128,
-    /// Issue #687: Minimum number of governance votes required to remove a compromised admin.
-    /// 0 means governance removal is disabled (admins can only be removed via multi-sig).
-    pub removal_vote_threshold: u32,
-    /// Issue #686: Fraction of the admin compensation pool each admin earns per epoch, in bps.
-    /// 0 means admin compensation is disabled.
-    pub admin_compensation_bps: u32,
+    /// Designated successor admin address that can claim admin rights without multi-sig approval
+    /// when current admins are unavailable.
+    pub successor_admin: Option<Address>,
 }
 
 // ── Data Types ────────────────────────────────────────────────────────────────
@@ -478,6 +464,21 @@ pub struct LoanRecord {
     pub escrow_status: EscrowStatus,
     /// Issue #669: Retry count for failed repayments (max 3).
     pub retry_count: u32,
+}
+
+/// #645: Pending loan restructure request — borrower requests, vouchers approve.
+#[contracttype]
+#[derive(Clone)]
+pub struct RestructureRequest {
+    pub borrower: Address,
+    /// New deadline (must be after current deadline).
+    pub new_deadline: u64,
+    /// Reduced outstanding amount (0 = no change to amount).
+    pub new_amount: i128,
+    /// Ledger timestamp when the request was created.
+    pub requested_at: u64,
+    /// Voucher addresses that have approved this request.
+    pub approvals: Vec<Address>,
 }
 
 /// A single payment event recorded against a loan.
@@ -570,22 +571,8 @@ pub enum TimelockAction {
     SetConfig(Config),
 }
 
-/// Escrow state for a repayment pending oracle verification.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum EscrowStatus {
-    /// No escrow in flight (default).
-    None,
-    /// Repayment held pending oracle approval.
-    Pending,
-    /// Oracle approved — funds released to vouchers.
-    Released,
-    /// Oracle rejected — funds returned to borrower.
-    Rejected,
-}
-
-/// A slash execution that has been approved by governance but is waiting for
-/// its `executable_at` delay to elapse before it can be carried out.
+/// A pending slash awaiting execution after the mandatory delay period.
+/// Created when a slash vote reaches quorum; executed via `execute_pending_slash`.
 #[contracttype]
 #[derive(Clone)]
 pub struct PendingSlashRecord {
@@ -645,21 +632,6 @@ pub struct WithdrawalRequest {
     pub borrower: Address,
     pub token: Address,
     pub requested_at: u64,
-}
-
-/// A pending slash awaiting execution after the mandatory delay period.
-/// Created when a slash vote reaches quorum; executed via `execute_pending_slash`.
-#[contracttype]
-#[derive(Clone)]
-pub struct PendingSlashRecord {
-    /// Borrower subject to the pending slash.
-    pub borrower: soroban_sdk::Address,
-    /// Ledger timestamp when the slash vote was approved.
-    pub approved_at: u64,
-    /// Earliest ledger timestamp at which the slash may be executed.
-    pub executable_at: u64,
-    /// True once the slash has been executed.
-    pub executed: bool,
 }
 
 /// A queued withdrawal request submitted during an active loan.

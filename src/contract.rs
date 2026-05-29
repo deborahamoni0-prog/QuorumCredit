@@ -71,15 +71,7 @@ impl QuorumCreditContract {
                 voting_period_seconds: crate::types::DEFAULT_VOTING_PERIOD_SECONDS,
                 slash_cooldown_seconds: 0,
                 emergency_pause_enabled: false,
-                early_repayment_discount_bps: 0,
-                oracle_address: None,
-                slash_delay_seconds: DEFAULT_SLASH_DELAY_SECONDS,
-                confirmation_required: DEFAULT_CONFIRMATION_REQUIRED,
-                dynamic_slash_threshold: DEFAULT_DYNAMIC_SLASH_THRESHOLD,
-                loan_size_slash_enabled: DEFAULT_LOAN_SIZE_SLASH_ENABLED,
-                loan_size_slash_max_bps: DEFAULT_LOAN_SIZE_SLASH_MAX_BPS,
-                removal_vote_threshold: 0,
-                admin_compensation_bps: 0,
+                successor_admin: None,
             },
         );
 

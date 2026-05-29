@@ -4,9 +4,8 @@ use crate::helpers::{
     require_admin_approval, require_governance_participant, require_not_paused,
 };
 use crate::types::{
-    AdminRemovalProposal, DataKey, LoanStatus, PendingSlashRecord, SlashAppealRecord,
-    SlashThresholdProposal, SlashVoteRecord, TimelockAction, TimelockProposal, VouchRecord,
-    BPS_DENOMINATOR,
+    DataKey, LoanStatus, PendingSlashRecord, SlashAppealRecord, SlashRecord, SlashThresholdProposal,
+    SlashVoteRecord, TimelockAction, TimelockProposal, VouchRecord, BPS_DENOMINATOR,
 };
 use soroban_sdk::{panic_with_error, symbol_short, Address, Env, Vec};
 
