@@ -345,6 +345,16 @@ pub struct Config {
     pub slash_cooldown_seconds: u64,
     /// When true, critical write paths are blocked until multi-sig emergency unpause.
     pub emergency_pause_enabled: bool,
+    /// Recovery percentage for defaulted loans (in basis points, 0 = disabled).
+    pub recovery_percentage: u32,
+    /// Where recovered slash funds are redirected.
+    pub redistribution_rule: RedistributionRule,
+    /// Immunity period after registration before slash can occur.
+    pub immunity_period_seconds: u64,
+    /// #668: Early repayment discount in basis points (0 = no discount).
+    pub early_repayment_discount_bps: u32,
+    /// #667: Oracle address for external credit score and repayment verification.
+    pub oracle_address: Option<Address>,
 }
 
 // ── Data Types ────────────────────────────────────────────────────────────────
@@ -361,7 +371,17 @@ pub struct AmortizationEntry {
 pub struct LoanRecord {
     pub id: u64,
     pub borrower: Address,
-    pub co_borrowers: Vec<Address>,
+    /// #656: Third-party guarantor for this loan (None if no guarantor).
+    pub guarantor: Option<Address>,
+    /// #657: Buyback price set by borrower for vouchers to buy back stake (0 = not available).
+    pub buyback_price: i128,
+    /// #658: Whether automatic repayments are enabled for this loan.
+    pub auto_repay_enabled: bool,
+    /// #658: Number of repayment attempts made (for tracking auto-repay retries).
+    pub auto_repay_attempts: u32,
+    /// #666/#667: Escrow status for oracle-verified repayments.
+    pub escrow_status: EscrowStatus,
+    co_borrowers: Vec<Address>,
     /// Total loan principal disbursed, in stroops. 1 XLM = 10,000,000 stroops.
     pub amount: i128,
     /// Cumulative repayments received so far (principal + yield), in stroops.
@@ -684,6 +704,27 @@ pub const FRAUD_SCORE_HIGH_THRESHOLD: u32 = 70;
 pub const FRAUD_SCORE_MAX: u32 = 100;
 pub const FRAUD_SCORE_DEFAULT_WEIGHT: u32 = 20;
 pub const FRAUD_SCORE_CONCENTRATION_WEIGHT: u32 = 10;
+
+// ── Redistribution Rule ────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RedistributionRule {
+    Treasury,
+    Insurance,
+    Protocol,
+}
+
+// ── Escrow Status (for #666/#667) ───────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EscrowStatus {
+    None,
+    Pending,
+    Released,
+    Rejected,
+}
 
 // ── #667: External Credit Score ───────────────────────────────────────────────
 

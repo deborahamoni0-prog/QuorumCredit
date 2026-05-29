@@ -68,4 +68,10 @@ pub enum ContractError {
     ProposalNotFound = 52,
     /// Governance proposal was already finalized.
     ProposalAlreadyFinalized = 53,
+    /// No escrow found for borrower.
+    NoEscrowFound = 54,
+    /// Maximum repayment retries exceeded.
+    MaxRetriesExceeded = 55,
+    /// Caller is not the authorized oracle.
+    OracleUnauthorized = 56,
 }
