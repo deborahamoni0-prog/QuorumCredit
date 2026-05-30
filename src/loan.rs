@@ -6,9 +6,8 @@ use crate::helpers::{
 };
 use crate::reputation::ReputationNftExternalClient;
 use crate::types::{
-    DataKey, LoanRecord, LoanStatus, SlashRecord, VouchRecord, BPS_DENOMINATOR, SLASH_ESCROW_PERIOD,
-    VOUCH_AGE_BONUS_MIN_SECS, VOUCH_AGE_BONUS_PERIOD_SECS, VOUCH_AGE_BONUS_BPS_PER_PERIOD,
-    VOUCH_AGE_BONUS_MAX_BPS, REPUTATION_BONUS_MAX_BPS, EscrowStatus, YieldDistributionEntry,
+    DataKey, EscrowStatus, LoanRecord, LoanStatus, SlashRecord, VouchRecord, BPS_DENOMINATOR,
+    SLASH_ESCROW_PERIOD,
 };
 use soroban_sdk::{panic_with_error, symbol_short, Address, Env, Vec};
 
@@ -155,6 +154,8 @@ pub fn request_loan(
         maturity_date: None,
         rate_type: crate::types::RateType::Fixed,
         index_reference: None,
+        escrow_status: EscrowStatus::None,
+        retry_count: 0,
     };
 
     env.storage().persistent().set(&DataKey::Loan(loan_id), &loan);

@@ -1,6 +1,33 @@
 use crate::errors::ContractError;
-use crate::types::{Config, DataKey, LoanRecord, LoanStatus};
+use crate::types::{
+    Config, DataKey, LoanRecord, LoanStatus,
+    MIN_DYNAMIC_SLASH_BPS, MAX_DYNAMIC_SLASH_BPS, HEALTH_THRESHOLD_BPS, BPS_DENOMINATOR,
+};
 use soroban_sdk::{token, Address, Env, String, Vec};
+
+// ── Reentrancy Guard ──────────────────────────────────────────────────────────
+
+/// Acquires the reentrancy lock. Returns `Err(Reentrancy)` if already locked.
+/// Must be paired with `release_lock` at the end of every state-mutating function.
+pub fn acquire_lock(env: &Env) -> Result<(), ContractError> {
+    let locked: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey::Locked)
+        .unwrap_or(false);
+    if locked {
+        return Err(ContractError::Reentrancy);
+    }
+    env.storage().instance().set(&DataKey::Locked, &true);
+    Ok(())
+}
+
+/// Releases the reentrancy lock. Always call this before returning from a guarded function.
+pub fn release_lock(env: &Env) {
+    env.storage().instance().set(&DataKey::Locked, &false);
+}
+
+// ── Pause Check ───────────────────────────────────────────────────────────────
 
 pub fn require_not_paused(env: &Env) -> Result<(), ContractError> {
     let paused: bool = env
@@ -20,10 +47,22 @@ pub fn require_not_paused(env: &Env) -> Result<(), ContractError> {
 
 pub fn require_positive_amount(_env: &Env, amount: i128) -> Result<(), ContractError> {
     if amount <= 0 {
-        return Err(ContractError::InsufficientFunds);
+        return Err(ContractError::InvalidAmount);
     }
     Ok(())
 }
+
+/// Validates that `timestamp` is non-zero and not in the past relative to `now`.
+/// Pass `now = env.ledger().timestamp()` for the current ledger time.
+/// Returns `Err(InvalidAmount)` if the timestamp is zero or already expired.
+pub fn validate_timestamp(_env: &Env, timestamp: u64, now: u64) -> Result<(), ContractError> {
+    if timestamp == 0 || timestamp <= now {
+        return Err(ContractError::InvalidAmount);
+    }
+    Ok(())
+}
+
+// ── Config & Loan Helpers ─────────────────────────────────────────────────────
 
 pub fn config(env: &Env) -> Config {
     env.storage()
@@ -126,12 +165,37 @@ pub fn validate_admin_config(
     env: &Env,
     admins: &Vec<Address>,
     admin_threshold: u32,
+    admin_whitelist: &Vec<Address>,
+    admin_blacklist: &Vec<Address>,
 ) -> Result<(), ContractError> {
     if admins.is_empty() {
         return Err(ContractError::InvalidAdminThreshold);
     }
     if admin_threshold == 0 || admin_threshold > admins.len() {
         return Err(ContractError::InvalidAdminThreshold);
+    }
+    for i in 0..admin_whitelist.len() {
+        let allowed = admin_whitelist.get(i).unwrap();
+        require_valid_address(env, &allowed)?;
+        for j in 0..i {
+            let prior = admin_whitelist.get(j).unwrap();
+            if allowed == prior {
+                return Err(ContractError::InvalidAdminThreshold);
+            }
+        }
+    }
+    for i in 0..admin_blacklist.len() {
+        let blocked = admin_blacklist.get(i).unwrap();
+        require_valid_address(env, &blocked)?;
+        for j in 0..i {
+            let prior = admin_blacklist.get(j).unwrap();
+            if blocked == prior {
+                return Err(ContractError::InvalidAdminThreshold);
+            }
+        }
+        if admin_whitelist.iter().any(|a| a == blocked) {
+            return Err(ContractError::InvalidAdminThreshold);
+        }
     }
     let admin_count = admins.len();
     for i in 0..admin_count {
@@ -142,6 +206,14 @@ pub fn validate_admin_config(
             if admin == prior_admin {
                 return Err(ContractError::InvalidAdminThreshold);
             }
+        }
+        if !admin_whitelist.is_empty()
+            && !admin_whitelist.iter().any(|allowed| allowed == admin)
+        {
+            return Err(ContractError::AdminNotWhitelisted);
+        }
+        if admin_blacklist.iter().any(|blocked| blocked == admin) {
+            return Err(ContractError::AdminBlacklisted);
         }
     }
     Ok(())
@@ -204,4 +276,68 @@ pub fn loan_status(env: &Env, borrower: &Address) -> LoanStatus {
         return loan.status;
     }
     LoanStatus::None
+}
+
+/// Compute the effective slash threshold considering dynamic adjustment.
+/// When `Config.dynamic_slash_threshold` is false, returns `Config.slash_bps` unchanged.
+/// When true, lowers the threshold proportionally when protocol health ≥ `HEALTH_THRESHOLD_BPS`
+/// and raises it when health is poor, clamped to `[MIN_DYNAMIC_SLASH_BPS, MAX_DYNAMIC_SLASH_BPS]`.
+pub fn calculate_dynamic_slash_threshold(env: &Env) -> i128 {
+    let cfg = config(env);
+    if !cfg.dynamic_slash_threshold {
+        return cfg.slash_bps;
+    }
+
+    let health = calculate_protocol_health_score(env);
+    if health >= HEALTH_THRESHOLD_BPS {
+        cfg.slash_bps.max(MIN_DYNAMIC_SLASH_BPS)
+    } else {
+        let adjustment = (HEALTH_THRESHOLD_BPS - health) * (MAX_DYNAMIC_SLASH_BPS - MIN_DYNAMIC_SLASH_BPS) / HEALTH_THRESHOLD_BPS;
+        (cfg.slash_bps + adjustment).clamp(MIN_DYNAMIC_SLASH_BPS, MAX_DYNAMIC_SLASH_BPS)
+    }
+}
+
+/// Protocol health score in basis points (0–10000).
+/// Factors: whether config exists (30%), not paused (30%), yield reserve solvency (40%).
+pub fn calculate_protocol_health_score(env: &Env) -> i128 {
+    let mut score: i128 = 0;
+
+    // 30%: initialized
+    if env.storage().instance().has(&DataKey::Config) {
+        score += 3_000;
+    }
+
+    // 30%: not paused
+    let paused: bool = env.storage().instance().get(&DataKey::Paused).unwrap_or(false);
+    let cfg = config(env);
+    if !paused && !cfg.emergency_pause_enabled {
+        score += 3_000;
+    }
+
+    // 40%: yield reserve solvent (non-zero balance)
+    let reserve: i128 = env.storage().instance().get(&DataKey::YieldReserve).unwrap_or(0);
+    if reserve > 0 {
+        score += 4_000;
+    }
+
+    score
+}
+
+/// Register `borrower` in the global `BorrowerList` if not already present.
+pub fn register_borrower_if_needed(env: &Env, borrower: &Address) {
+    use soroban_sdk::Vec as SdkVec;
+    let mut list: SdkVec<Address> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::BorrowerList)
+        .unwrap_or(SdkVec::new(env));
+
+    if !list.iter().any(|b| &b == borrower) {
+        list.push_back(borrower.clone());
+        env.storage().persistent().set(&DataKey::BorrowerList, &list);
+    }
+}
+
+pub fn primary_token(env: &Env) -> token::Client {
+    token::Client::new(env, &config(env).token)
 }

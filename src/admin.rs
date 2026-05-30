@@ -1,15 +1,32 @@
+use crate::errors::ContractError;
 use crate::helpers::{
     config, is_admin, require_admin_approval, require_not_paused, require_valid_token,
     validate_admin_config,
 };
-use crate::types::{Config, ConfigUpdateKey, ConfigUpdateProposal, DataKey, AdminActionProposal};
+use crate::types::{AdminActionProposal, Config, ConfigUpdateKey, ConfigUpdateProposal, DataKey};
 use soroban_sdk::{panic_with_error, symbol_short, Address, BytesN, Env, Vec};
-use crate::errors::ContractError;
+
+fn validate_admin_member(env: &Env, admin: &Address, config: &Config) {
+    if !config.admin_whitelist.is_empty()
+        && !config.admin_whitelist.iter().any(|allowed| allowed == *admin)
+    {
+        panic_with_error!(&env, ContractError::AdminNotWhitelisted);
+    }
+    if config
+        .admin_blacklist
+        .iter()
+        .any(|blocked| blocked == *admin)
+    {
+        panic_with_error!(&env, ContractError::AdminBlacklisted);
+    }
+}
 
 pub fn add_admin(env: Env, admin_signers: Vec<Address>, new_admin: Address) {
     require_admin_approval(&env, &admin_signers);
 
     let mut cfg = config(&env);
+
+    validate_admin_member(&env, &new_admin, &cfg);
 
     if cfg.admins.iter().any(|a| a == new_admin) {
         panic_with_error!(&env, ContractError::AlreadyInitialized);
@@ -66,6 +83,8 @@ pub fn rotate_admin(env: Env, admin_signers: Vec<Address>, old_admin: Address, n
 
     let mut cfg = config(&env);
 
+    validate_admin_member(&env, &new_admin, &cfg);
+
     if cfg.admins.iter().any(|a| a == new_admin) {
         panic_with_error!(&env, ContractError::AlreadyInitialized);
     }
@@ -103,6 +122,92 @@ pub fn set_admin_threshold(env: Env, admin_signers: Vec<Address>, new_threshold:
     env.events().publish(
         (symbol_short!("admin"), symbol_short!("thresh")),
         new_threshold,
+    );
+}
+
+/// Issue #688: Add an address to the admin whitelist.
+pub fn add_to_admin_whitelist(env: Env, admin_signers: Vec<Address>, address: Address) {
+    require_admin_approval(&env, &admin_signers);
+
+    let mut cfg = config(&env);
+
+    if cfg.admin_whitelist.iter().any(|a| a == address) {
+        panic_with_error!(&env, ContractError::AlreadyInitialized);
+    }
+    if cfg.admin_blacklist.iter().any(|a| a == address) {
+        panic_with_error!(&env, ContractError::AdminBlacklisted);
+    }
+
+    cfg.admin_whitelist.push_back(address.clone());
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("wl_add")),
+        address,
+    );
+}
+
+/// Issue #688: Remove an address from the admin whitelist.
+pub fn remove_from_admin_whitelist(env: Env, admin_signers: Vec<Address>, address: Address) {
+    require_admin_approval(&env, &admin_signers);
+
+    let mut cfg = config(&env);
+
+    let idx = cfg
+        .admin_whitelist
+        .iter()
+        .position(|a| a == address)
+        .expect("address not in whitelist") as u32;
+
+    cfg.admin_whitelist.remove(idx);
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("wl_rm")),
+        address,
+    );
+}
+
+/// Issue #689: Add an address to the admin blacklist.
+pub fn add_to_admin_blacklist(env: Env, admin_signers: Vec<Address>, address: Address) {
+    require_admin_approval(&env, &admin_signers);
+
+    let mut cfg = config(&env);
+
+    if cfg.admin_blacklist.iter().any(|a| a == address) {
+        panic_with_error!(&env, ContractError::AlreadyInitialized);
+    }
+    if cfg.admin_whitelist.iter().any(|a| a == address) {
+        panic_with_error!(&env, ContractError::AdminNotWhitelisted);
+    }
+
+    cfg.admin_blacklist.push_back(address.clone());
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("bl_add")),
+        address,
+    );
+}
+
+/// Issue #689: Remove an address from the admin blacklist.
+pub fn remove_from_admin_blacklist(env: Env, admin_signers: Vec<Address>, address: Address) {
+    require_admin_approval(&env, &admin_signers);
+
+    let mut cfg = config(&env);
+
+    let idx = cfg
+        .admin_blacklist
+        .iter()
+        .position(|a| a == address)
+        .expect("address not in blacklist") as u32;
+
+    cfg.admin_blacklist.remove(idx);
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("bl_rm")),
+        address,
     );
 }
 
@@ -221,8 +326,14 @@ pub fn blacklist(env: Env, admin_signers: Vec<Address>, borrower: Address) {
 pub fn set_config(env: Env, admin_signers: Vec<Address>, config: Config) {
     require_not_paused(&env).expect("contract paused");
     require_admin_approval(&env, &admin_signers);
-    validate_admin_config(&env, &config.admins, config.admin_threshold)
-        .expect("invalid admin config");
+    validate_admin_config(
+        &env,
+        &config.admins,
+        config.admin_threshold,
+        &config.admin_whitelist,
+        &config.admin_blacklist,
+    )
+    .expect("invalid admin config");
     if config.yield_bps < 0 || config.yield_bps > 10_000 {
         panic_with_error!(&env, ContractError::InvalidBps);
     }
@@ -310,6 +421,53 @@ pub fn set_dynamic_slash_threshold(
 /// This function can be called by anyone to see what slash rate would be applied.
 pub fn get_effective_slash_threshold(env: Env) -> i128 {
     crate::helpers::calculate_dynamic_slash_threshold(&env)
+}
+
+/// Toggle loan-size-based slash scaling on/off.
+/// When enabled, the slash percentage scales linearly with loan size relative to
+/// total staked collateral: small loans use `slash_bps`, large loans scale up to
+/// `loan_size_slash_max_bps`.
+pub fn set_loan_size_slash_enabled(
+    env: Env,
+    admin_signers: Vec<Address>,
+    enabled: bool,
+) {
+    require_admin_approval(&env, &admin_signers);
+
+    let mut cfg = config(&env);
+    cfg.loan_size_slash_enabled = enabled;
+
+    env.storage().instance().set(&DataKey::Config, &cfg);
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("lsslash")),
+        (admin_signers.get(0).unwrap(), enabled, env.ledger().timestamp()),
+    );
+}
+
+/// Set the maximum slash rate applied to the largest loans when loan-size scaling is enabled.
+/// Must be >= the current slash_bps and <= 10_000 (100%).
+pub fn set_loan_size_slash_max_bps(
+    env: Env,
+    admin_signers: Vec<Address>,
+    max_bps: i128,
+) {
+    require_admin_approval(&env, &admin_signers);
+
+    let cfg = config(&env);
+    assert!(
+        max_bps >= cfg.slash_bps,
+        "loan_size_slash_max_bps must be >= slash_bps"
+    );
+    assert!(max_bps <= 10_000, "loan_size_slash_max_bps cannot exceed 100%");
+
+    let mut updated = cfg;
+    updated.loan_size_slash_max_bps = max_bps;
+
+    env.storage().instance().set(&DataKey::Config, &updated);
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("lsmaxbps")),
+        (admin_signers.get(0).unwrap(), max_bps, env.ledger().timestamp()),
+    );
 }
 
 pub fn set_reputation_nft(env: Env, admin_signers: Vec<Address>, nft_contract: Address) {
@@ -596,6 +754,55 @@ pub fn accept_admin(env: Env) -> Result<(), ContractError> {
     env.events().publish(
         (symbol_short!("admin"), symbol_short!("accepted")),
         new_admin,
+    );
+
+    Ok(())
+}
+
+/// Designate a successor admin who can claim admin rights without multi-sig approval.
+/// Only the current admin set can designate a successor. Pass `None` to clear.
+pub fn set_successor_admin(
+    env: Env,
+    admin_signers: Vec<Address>,
+    successor: Option<Address>,
+) {
+    require_admin_approval(&env, &admin_signers);
+
+    if let Some(ref addr) = successor {
+        if is_admin(&env, addr) {
+            panic_with_error!(&env, ContractError::AlreadyInitialized);
+        }
+    }
+
+    let mut cfg = config(&env);
+    cfg.successor_admin = successor.clone();
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("successor")),
+        (admin_signers.get(0).unwrap(), successor),
+    );
+}
+
+/// Claim admin rights as the designated successor admin.
+/// The caller must match the stored `successor_admin` address and authenticate.
+/// On success, the caller is added to the admin list and the successor slot is cleared.
+pub fn claim_successor_admin(env: Env) -> Result<(), ContractError> {
+    let mut cfg = config(&env);
+    let successor = cfg
+        .successor_admin
+        .clone()
+        .ok_or(ContractError::UnauthorizedCaller)?;
+
+    successor.require_auth();
+
+    cfg.admins.push_back(successor.clone());
+    cfg.successor_admin = None;
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("cl_succ")),
+        successor,
     );
 
     Ok(())
@@ -904,4 +1111,182 @@ pub fn emergency_unpause(env: Env, admin_signers: Vec<Address>) -> Result<(), Co
     );
 
     Ok(())
+}
+
+/// Toggle the borrower repayment confirmation requirement on/off.
+/// When enabled, borrowers must call `confirm_repayment` before `repay`.
+/// When disabled (default), `repay` works without any prior confirmation.
+pub fn set_confirmation_required(
+    env: Env,
+    admin_signers: Vec<Address>,
+    enabled: bool,
+) {
+    require_admin_approval(&env, &admin_signers);
+
+    let mut cfg = config(&env);
+    cfg.confirmation_required = enabled;
+
+    env.storage().instance().set(&DataKey::Config, &cfg);
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("cnf_req")),
+        (admin_signers.get(0).unwrap(), enabled, env.ledger().timestamp()),
+    );
+}
+
+// ── Issue #686: Admin compensation ───────────────────────────────────────────
+
+/// Set the admin compensation rate.
+///
+/// `compensation_bps` is the fraction of the admin compensation pool that is
+/// distributed across all admins each time `claim_admin_compensation` is called.
+/// Must be in range [0, 10000]. 0 disables compensation.
+pub fn set_admin_compensation_bps(
+    env: Env,
+    admin_signers: Vec<Address>,
+    compensation_bps: u32,
+) {
+    require_admin_approval(&env, &admin_signers);
+    if compensation_bps > 10_000 {
+        panic_with_error!(&env, ContractError::InvalidBps);
+    }
+
+    let mut cfg = config(&env);
+    cfg.admin_compensation_bps = compensation_bps;
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("cmp_bps")),
+        (admin_signers.get(0).unwrap(), compensation_bps, env.ledger().timestamp()),
+    );
+}
+
+/// Add funds to the admin compensation pool.
+///
+/// Anyone may call this to top up the pool (e.g. from protocol revenues).
+/// The caller must hold at least `amount` tokens and authorize the transfer.
+pub fn fund_admin_compensation(
+    env: Env,
+    funder: Address,
+    amount: i128,
+) -> Result<(), ContractError> {
+    funder.require_auth();
+    if amount <= 0 {
+        panic_with_error!(&env, ContractError::InvalidAmount);
+    }
+
+    let cfg = config(&env);
+    soroban_sdk::token::Client::new(&env, &cfg.token)
+        .transfer(&funder, &env.current_contract_address(), &amount);
+
+    let pool: i128 = env
+        .storage()
+        .instance()
+        .get(&DataKey::AdminCompensation)
+        .unwrap_or(0i128);
+    env.storage()
+        .instance()
+        .set(&DataKey::AdminCompensation, &(pool + amount));
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("cmp_fund")),
+        (funder, amount, env.ledger().timestamp()),
+    );
+
+    Ok(())
+}
+
+/// Claim admin compensation.
+///
+/// Each admin receives an equal pro-rata share of
+/// `pool_balance * admin_compensation_bps / 10_000` split across all admins.
+/// No more than once per 24 hours per admin (enforced via `AdminLastClaim`).
+pub fn claim_admin_compensation(env: Env, admin: Address) -> Result<i128, ContractError> {
+    admin.require_auth();
+
+    if !is_admin(&env, &admin) {
+        return Err(ContractError::UnauthorizedCaller);
+    }
+
+    let cfg = config(&env);
+    if cfg.admin_compensation_bps == 0 {
+        return Err(ContractError::InvalidAmount);
+    }
+
+    let now = env.ledger().timestamp();
+    if let Some(last_claim) = env
+        .storage()
+        .instance()
+        .get::<DataKey, u64>(&DataKey::AdminLastClaim(admin.clone()))
+    {
+        if now.saturating_sub(last_claim) < 24 * 60 * 60 {
+            return Err(ContractError::VouchCooldownActive);
+        }
+    }
+
+    let pool: i128 = env
+        .storage()
+        .instance()
+        .get(&DataKey::AdminCompensation)
+        .unwrap_or(0i128);
+
+    if pool == 0 {
+        return Err(ContractError::InsufficientFunds);
+    }
+
+    let num_admins = cfg.admins.len() as i128;
+    let total_payout = pool * cfg.admin_compensation_bps as i128 / 10_000;
+    let share = total_payout / num_admins;
+
+    if share <= 0 {
+        return Err(ContractError::InsufficientFunds);
+    }
+
+    let new_pool = pool - share;
+    env.storage()
+        .instance()
+        .set(&DataKey::AdminCompensation, &new_pool);
+    env.storage()
+        .instance()
+        .set(&DataKey::AdminLastClaim(admin.clone()), &now);
+
+    soroban_sdk::token::Client::new(&env, &cfg.token)
+        .transfer(&env.current_contract_address(), &admin, &share);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("cmp_clm")),
+        (admin, share, env.ledger().timestamp()),
+    );
+
+    Ok(share)
+}
+
+/// Return the current admin compensation rate in basis points.
+pub fn get_admin_compensation_bps(env: Env) -> u32 {
+    config(&env).admin_compensation_bps
+}
+
+/// Return the current balance of the admin compensation pool, in stroops.
+pub fn get_admin_compensation_pool(env: Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::AdminCompensation)
+        .unwrap_or(0i128)
+}
+
+/// Set the governance removal vote threshold for admin removal (#687).
+pub fn set_removal_vote_threshold(
+    env: Env,
+    admin_signers: Vec<Address>,
+    threshold: u32,
+) {
+    require_admin_approval(&env, &admin_signers);
+
+    let mut cfg = config(&env);
+    cfg.removal_vote_threshold = threshold;
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("rmv_thr")),
+        (admin_signers.get(0).unwrap(), threshold, env.ledger().timestamp()),
+    );
 }

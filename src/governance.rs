@@ -1,12 +1,11 @@
-use crate::errors::ContractError;
+﻿use crate::errors::ContractError;
 use crate::helpers::{
     add_slash_balance, config, get_active_loan_record, get_latest_loan_record, has_active_loan,
-    require_governance_participant, require_not_paused,
+    require_admin_approval, require_governance_participant, require_not_paused,
 };
-use crate::insurance;
 use crate::types::{
-    DataKey, LoanStatus, SlashThresholdProposal, SlashVoteRecord, TimelockAction,
-    TimelockProposal, VouchRecord, BPS_DENOMINATOR, SlashAppealRecord,
+    DataKey, LoanStatus, PendingSlashRecord, SlashAppealRecord, SlashRecord, SlashThresholdProposal,
+    SlashVoteRecord, TimelockAction, TimelockProposal, VouchRecord, BPS_DENOMINATOR,
 };
 use soroban_sdk::{panic_with_error, symbol_short, Address, Env, Vec};
 
@@ -26,6 +25,17 @@ pub fn vote_slash(
 ) -> Result<(), ContractError> {
     voucher.require_auth();
     require_not_paused(&env)?;
+
+    // Check for an already-executed vote first (before the active-loan guard).
+    let existing_vote: Option<SlashVoteRecord> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::SlashVote(borrower.clone()));
+    if let Some(ref v) = existing_vote {
+        if v.executed {
+            return Err(ContractError::SlashAlreadyExecuted);
+        }
+    }
 
     let cfg = config(&env);
     let now = env.ledger().timestamp();
@@ -147,7 +157,7 @@ pub fn vote_slash(
             .set(&DataKey::PendingSlashExecution(borrower.clone()), &pending_slash);
         
         env.events().publish(
-            (symbol_short!("gov"), symbol_short!("slash_pending")),
+            (symbol_short!("gov"), symbol_short!("slsh_pend")),
             (borrower.clone(), now, executable_at),
         );
     } else {
@@ -167,7 +177,7 @@ pub fn get_slash_vote(env: Env, borrower: Address) -> Option<SlashVoteRecord> {
 }
 
 /// Set the quorum threshold (in basis points) required to auto-execute a slash.
-/// Requires admin approval — called from admin module.
+/// Requires admin approval â€” called from admin module.
 pub fn set_slash_vote_quorum(env: &Env, quorum_bps: u32) {
     if quorum_bps > 10_000 {
         panic_with_error!(env, ContractError::InvalidBps);
@@ -261,79 +271,14 @@ pub fn execute_pending_slash(env: Env, borrower: Address) -> Result<(), Contract
     execute_slash(&env, &borrower)?;
 
     env.events().publish(
-        (symbol_short!("gov"), symbol_short!("slash_executed")),
+        (symbol_short!("gov"), symbol_short!("slsh_exec")),
         (borrower.clone(), now),
     );
 
     Ok(())
 }
 
-// ── Internal ──────────────────────────────────────────────────────────────────
-
-fn check_borrower_immunity(env: &Env, borrower: &Address, cfg: &crate::types::Config) -> Result<(), ContractError> {
-    if cfg.immunity_period_seconds == 0 {
-        return Ok(());
-    }
-    let registered = borrower_registration_time(env, borrower);
-    if registered == 0 {
-        return Ok(());
-    }
-    let elapsed = env.ledger().timestamp().saturating_sub(registered);
-    if elapsed < cfg.immunity_period_seconds {
-        return Err(ContractError::BorrowerImmune);
-    }
-    Ok(())
-}
-
-fn route_slashed_funds(
-    env: &Env,
-    loan_token: &Address,
-    vouches: &Vec<VouchRecord>,
-    distributable: i128,
-    rule: RedistributionRule,
-) {
-    if distributable <= 0 {
-        return;
-    }
-    match rule {
-        RedistributionRule::Treasury => add_slash_balance(env, distributable),
-        RedistributionRule::Vouchers => {
-            let mut total_stake: i128 = 0;
-            for v in vouches.iter() {
-                if v.token == *loan_token {
-                    total_stake += v.stake;
-                }
-            }
-            if total_stake == 0 {
-                add_slash_balance(env, distributable);
-                return;
-            }
-            let token = soroban_sdk::token::Client::new(env, loan_token);
-            let contract = env.current_contract_address();
-            let mut distributed: i128 = 0;
-            let mut last_voucher: Option<Address> = None;
-            for v in vouches.iter() {
-                if v.token != *loan_token {
-                    continue;
-                }
-                last_voucher = Some(v.voucher.clone());
-                let share = distributable * v.stake / total_stake;
-                distributed += share;
-                if share > 0 {
-                    token.transfer(&contract, &v.voucher, &share);
-                }
-            }
-            let remainder = distributable - distributed;
-            if remainder > 0 {
-                if let Some(voucher) = last_voucher {
-                    token.transfer(&contract, &voucher, &remainder);
-                } else {
-                    add_slash_balance(env, remainder);
-                }
-            }
-        }
-    }
-}
+// â”€â”€ Internal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 fn next_slash_id(env: &Env) -> u64 {
     let id = env
@@ -432,15 +377,33 @@ fn execute_slash(env: &Env, borrower: &Address) -> Result<(), ContractError> {
     }
     let loan_token = soroban_sdk::token::Client::new(env, &loan.token_address);
 
+    // Calculate total stake backing this borrower (used for loan-size scaling)
+    let total_stake: i128 = vouches.iter().map(|v| v.stake).sum();
+
+    // Determine the effective slash rate, factoring in loan size and/or protocol health
+    let effective_slash_bps =
+        crate::helpers::calculate_effective_slash_bps(env, loan.amount, total_stake);
+
     let mut total_slashed: i128 = 0;
     let mut remaining_vouches: Vec<VouchRecord> = Vec::new(env);
+    // Calculate effective slash basis points based on default count (graduated penalties)
+    let default_count: u32 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::DefaultCount(borrower.clone()))
+        .unwrap_or(0);
+    let base_slash_bps = cfg.slash_bps;
+    let mut effective_slash_bps = base_slash_bps + (default_count as i128) * 500;
+    if effective_slash_bps > 10_000 {
+        effective_slash_bps = 10_000;
+    }
 
     for v in vouches.iter() {
         if v.token != loan.token_address {
             remaining_vouches.push_back(v);
             continue;
         }
-        let slash_amount = v.stake * cfg.slash_bps / BPS_DENOMINATOR;
+        let slash_amount = v.stake * effective_slash_bps / BPS_DENOMINATOR;
         let remaining = v.stake - slash_amount;
         total_slashed += slash_amount;
 
@@ -526,13 +489,13 @@ fn execute_slash(env: &Env, borrower: &Address) -> Result<(), ContractError> {
 
     env.events().publish(
         (symbol_short!("gov"), symbol_short!("slashed")),
-        (borrower.clone(), total_slashed, slash_id),
+        (borrower.clone(), total_slashed, slash_id, effective_slash_bps),
     );
 
     Ok(())
 }
 
-/// ── Issue 109: Slash Proposal Confirmation Window ──
+/// â”€â”€ Issue 109: Slash Proposal Confirmation Window â”€â”€
 ///
 /// Implements a two-step slash with timelock pattern:
 /// 1. propose_slash: Admin creates a proposal, sets execution time (eta)
@@ -819,7 +782,7 @@ pub fn execute_slash_appeal(
     Ok(())
 }
 
-// ── Issue #680: Slash threshold governance voting ─────────────────────────────
+// â”€â”€ Issue #680: Slash threshold governance voting â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 pub fn propose_slash_threshold(
     env: Env,
@@ -971,4 +934,238 @@ pub fn get_slash_threshold_proposal(
     env.storage()
         .instance()
         .get(&DataKey::SlashThresholdProposal(proposal_id))
+}
+
+// ── Slashing Transparency Report ──────────────────────────────────────────────
+
+/// Generate (or refresh) the monthly slashing report for `month_id`.
+///
+/// `month_id` = `unix_timestamp / MONTHLY_PERIOD_SECS`.
+/// Iterates all recorded slash events and aggregates those whose
+/// `slash_timestamp` falls within the requested month window.
+/// The result is persisted under `DataKey::SlashingReport(month_id)`.
+pub fn generate_slashing_report(env: Env, month_id: u64) -> SlashingReportRecord {
+    let total_ids: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::SlashRecordCounter)
+        .unwrap_or(0);
+
+    let month_start = month_id * MONTHLY_PERIOD_SECS;
+    let month_end = month_start + MONTHLY_PERIOD_SECS;
+
+    let mut slash_ids: Vec<u64> = Vec::new(&env);
+    let mut total_slashed: i128 = 0;
+    let mut total_slashes: u32 = 0;
+    let mut total_reversed: u32 = 0;
+
+    for id in 1..=total_ids {
+        let record: crate::types::SlashRecord = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::SlashRecord(id))
+        {
+            Some(r) => r,
+            None => continue,
+        };
+
+        if record.slash_timestamp >= month_start && record.slash_timestamp < month_end {
+            total_slashes += 1;
+            total_slashed += record.total_slashed;
+            if record.reversed {
+                total_reversed += 1;
+            }
+            slash_ids.push_back(id);
+        }
+    }
+
+    let report = SlashingReportRecord {
+        month_id,
+        total_slashes,
+        total_slashed,
+        total_reversed,
+        slash_ids,
+    };
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::SlashingReport(month_id), &report);
+
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("rpt_gen")),
+        (month_id, total_slashes, total_slashed),
+    );
+
+    report
+}
+
+/// Return the cached slashing report for `month_id`, or `None` if not yet generated.
+pub fn get_slashing_report(env: Env, month_id: u64) -> Option<SlashingReportRecord> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::SlashingReport(month_id))
+}
+
+// ── Issue #687: Governance-based admin removal ────────────────────────────────
+
+/// Propose removing a compromised admin via governance vote.
+///
+/// Any governance participant (active voucher or admin) may call this.
+/// The proposal passes once `approve_votes >= Config.removal_vote_threshold`.
+pub fn propose_admin_removal(
+    env: Env,
+    proposer: Address,
+    admin_to_remove: Address,
+) -> Result<u64, ContractError> {
+    proposer.require_auth();
+    require_not_paused(&env)?;
+    require_governance_participant(&env, &proposer)?;
+
+    let cfg = config(&env);
+
+    if cfg.removal_vote_threshold == 0 {
+        return Err(ContractError::UnauthorizedCaller);
+    }
+
+    if !cfg.admins.iter().any(|a| a == admin_to_remove) {
+        return Err(ContractError::UnauthorizedCaller);
+    }
+
+    let proposal_id: u64 = env
+        .storage()
+        .instance()
+        .get::<DataKey, u64>(&DataKey::AdminRemovalProposalCounter)
+        .unwrap_or(0u64)
+        .checked_add(1)
+        .expect("proposal id overflow");
+
+    let proposal = AdminRemovalProposal {
+        id: proposal_id,
+        admin_to_remove: admin_to_remove.clone(),
+        proposer: proposer.clone(),
+        approve_votes: 0,
+        reject_votes: 0,
+        voters: Vec::new(&env),
+        proposed_at: env.ledger().timestamp(),
+        finalized: false,
+    };
+
+    env.storage()
+        .instance()
+        .set(&DataKey::AdminRemovalProposal(proposal_id), &proposal);
+    env.storage()
+        .instance()
+        .set(&DataKey::AdminRemovalProposalCounter, &proposal_id);
+
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("rm_prop")),
+        (proposal_id, proposer, admin_to_remove),
+    );
+
+    Ok(proposal_id)
+}
+
+/// Cast a vote on an admin removal proposal.
+///
+/// Any governance participant may vote once per proposal.
+/// Voting closes once the proposal is finalized.
+pub fn vote_admin_removal(
+    env: Env,
+    voter: Address,
+    proposal_id: u64,
+    approve: bool,
+) -> Result<(), ContractError> {
+    voter.require_auth();
+    require_not_paused(&env)?;
+    require_governance_participant(&env, &voter)?;
+
+    let mut proposal: AdminRemovalProposal = env
+        .storage()
+        .instance()
+        .get(&DataKey::AdminRemovalProposal(proposal_id))
+        .ok_or(ContractError::ProposalNotFound)?;
+
+    if proposal.finalized {
+        return Err(ContractError::ProposalAlreadyFinalized);
+    }
+
+    if proposal.voters.iter().any(|v| v == voter) {
+        return Err(ContractError::AlreadyVoted);
+    }
+
+    if approve {
+        proposal.approve_votes += 1;
+    } else {
+        proposal.reject_votes += 1;
+    }
+    proposal.voters.push_back(voter.clone());
+
+    env.storage()
+        .instance()
+        .set(&DataKey::AdminRemovalProposal(proposal_id), &proposal);
+
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("rm_vote")),
+        (proposal_id, voter, approve),
+    );
+
+    Ok(())
+}
+
+/// Finalize an admin removal proposal.
+///
+/// Succeeds once `approve_votes >= Config.removal_vote_threshold`.
+/// On success, the targeted admin is removed from `Config.admins`.
+/// Fails if the removal would drop the admin count below `admin_threshold`.
+pub fn finalize_admin_removal(env: Env, proposal_id: u64) -> Result<(), ContractError> {
+    require_not_paused(&env)?;
+
+    let mut proposal: AdminRemovalProposal = env
+        .storage()
+        .instance()
+        .get(&DataKey::AdminRemovalProposal(proposal_id))
+        .ok_or(ContractError::ProposalNotFound)?;
+
+    if proposal.finalized {
+        return Err(ContractError::ProposalAlreadyFinalized);
+    }
+
+    let mut cfg = config(&env);
+
+    if proposal.approve_votes < cfg.removal_vote_threshold {
+        return Err(ContractError::QuorumNotMet);
+    }
+
+    let idx = cfg
+        .admins
+        .iter()
+        .position(|a| a == proposal.admin_to_remove)
+        .ok_or(ContractError::UnauthorizedCaller)? as u32;
+
+    cfg.admins.remove(idx);
+
+    if cfg.admins.len() < cfg.admin_threshold {
+        return Err(ContractError::InvalidAdminThreshold);
+    }
+
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    proposal.finalized = true;
+    env.storage()
+        .instance()
+        .set(&DataKey::AdminRemovalProposal(proposal_id), &proposal);
+
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("rm_done")),
+        (proposal_id, proposal.admin_to_remove.clone()),
+    );
+
+    Ok(())
+}
+
+/// Return a governance admin-removal proposal by ID.
+pub fn get_admin_removal_proposal(env: Env, proposal_id: u64) -> Option<AdminRemovalProposal> {
+    env.storage()
+        .instance()
+        .get(&DataKey::AdminRemovalProposal(proposal_id))
 }
