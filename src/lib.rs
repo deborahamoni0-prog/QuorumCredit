@@ -8,6 +8,7 @@ pub mod governance;
 pub mod helpers;
 pub mod insurance;
 pub mod loan;
+pub mod partial_repayment;
 pub mod reputation;
 pub mod rbac;
 pub mod syndication;
@@ -55,7 +56,16 @@ mod governance_queue_test;
 #[cfg(test)]
 mod credit_score_test;
 #[cfg(test)]
+#[cfg(test)]
 mod syndication_test;
+#[cfg(test)]
+mod integration_scenarios;
+#[cfg(test)]
+mod integration_invariants;
+#[cfg(test)]
+mod integration_stress_test;
+#[cfg(test)]
+mod integration_regression_test;main
 
 use crate::helpers::{
     config, get_active_loan_record, has_active_loan, loan_status as helper_loan_status,

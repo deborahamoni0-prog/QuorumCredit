@@ -249,6 +249,36 @@ pub enum RateType {
     Variable,
 }
 
+// ── Pause State Machine ───────────────────────────────────────────────────────
+
+/// Contract pause state for the Normal → Paused → Thawing → Normal state machine.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PauseMode {
+    /// Contract is operating normally.
+    None,
+    /// Contract is fully paused — all writes are blocked.
+    Paused,
+    /// Contract is thawing — only reads and withdrawals are allowed.
+    /// Automatically transitions to `None` after `thaw_duration` seconds.
+    Thawing,
+}
+
+/// Timestamps recorded when the contract enters or exits a thaw period.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ThawState {
+    /// Ledger timestamp when `pause()` was called.
+    pub pause_timestamp: u64,
+    /// Duration of the thaw window in seconds (default 24 h = 86_400).
+    pub thaw_duration: u64,
+    /// Ledger timestamp when `begin_thaw()` was called.
+    pub thaw_start_timestamp: u64,
+}
+
+/// Duration of the thaw period in seconds (24 hours).
+pub const THAW_DURATION_SECS: u64 = 24 * 60 * 60;
+
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -991,8 +1021,12 @@ pub struct LoanRecord {
     /// For variable-rate loans: the oracle key or index name used to look up the
     /// current rate (e.g. `"SOFR"`, `"PRIME"`). `None` for fixed-rate loans.
     pub index_reference: Option<soroban_sdk::String>,
-    /// Issue #666/#667: Escrow status for oracle-verified repayments.
-    pub escrow_status: EscrowStatus,
+    /// Issue #838: Timestamp of last compound interest calculation (for daily compounding).
+    pub last_interest_calc: u64,
+    /// Issue #838: Accrued compound interest from partial repayments (in stroops).
+    pub accrued_interest: i128,
+    /// Issue #838: Milestone bonus applied (50% repaid threshold).
+    pub milestone_bonus_applied: bool,
     /// Issue #669: Retry count for failed repayments (max 3).
     pub retry_count: u32,
 }
