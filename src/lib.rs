@@ -1,7 +1,6 @@
 #![no_std]
 
 pub mod admin;
-mod contract;
 pub mod credit_score;
 pub mod errors;
 pub mod governance;
@@ -19,7 +18,6 @@ pub mod vouch;
 pub mod cache;
 pub mod error_response;
 pub mod versioning;
-pub mod proof_validator;
 pub mod cross_chain;
 
 pub use errors::ContractError;
@@ -50,12 +48,7 @@ mod cross_chain_vouch_test;
 #[cfg(test)]
 mod property_stake_loan_invariants_test;
 #[cfg(test)]
-mod admin_whitelist_blacklist_test;
-#[cfg(test)]
-mod governance_queue_test;
-#[cfg(test)]
 mod credit_score_test;
-#[cfg(test)]
 #[cfg(test)]
 mod syndication_test;
 #[cfg(test)]
@@ -65,7 +58,7 @@ mod integration_invariants;
 #[cfg(test)]
 mod integration_stress_test;
 #[cfg(test)]
-mod integration_regression_test;main
+mod integration_regression_test;
 
 use crate::helpers::{
     config, get_active_loan_record, has_active_loan, loan_status as helper_loan_status,
